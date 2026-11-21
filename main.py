@@ -38,6 +38,10 @@ LINE_WIDTH_SELECTED = 4.0
 LINE_WIDTH_DIMMED = 1.6
 DIM_BLEND_FACTOR = 0.25  # 25% method colour + 75% canvas background
 
+MIN_ZOOM = 0.25
+MAX_ZOOM = 3.0
+ZOOM_STEP = 1.12
+
 PANEL_WIDTH = 360
 CLICK_DRAG_THRESHOLD = 5
 
@@ -272,17 +276,19 @@ def rect_border_point(cx, cy, half_w, half_h, dir_x, dir_y, pad=3.0):
     return cx + dir_x * t, cy + dir_y * t
 
 
-def draw_node(canvas, node, tag, selected=False):
-    x, y = node["x"], node["y"]
-    text_id = canvas.create_text(
-        x,
-        y,
+def measure_node_base_size(canvas, node):
+    if "base_width" in node and "base_height" in node:
+        return node["base_width"], node["base_height"]
+
+    probe_id = canvas.create_text(
+        0,
+        0,
         text=node["name"],
-        fill=NODE_TEXT,
         font=("Segoe UI", 11, "bold"),
-        tags=(tag, "node"),
     )
-    bbox = canvas.bbox(text_id)
+    bbox = canvas.bbox(probe_id)
+    canvas.delete(probe_id)
+
     if bbox:
         text_w = bbox[2] - bbox[0]
         text_h = bbox[3] - bbox[1]
@@ -290,20 +296,45 @@ def draw_node(canvas, node, tag, selected=False):
         text_w = len(node["name"]) * 8
         text_h = 18
 
-    width = max(NODE_MIN_W, text_w + NODE_PAD_X * 2)
-    height = max(NODE_MIN_H, text_h + NODE_PAD_Y * 2)
-    x1, y1 = x - width / 2, y - height / 2
-    x2, y2 = x + width / 2, y + height / 2
+    base_w = max(NODE_MIN_W, text_w + NODE_PAD_X * 2)
+    base_h = max(NODE_MIN_H, text_h + NODE_PAD_Y * 2)
+    node["base_width"] = base_w
+    node["base_height"] = base_h
+    return base_w, base_h
 
+
+def draw_node(canvas, node, tag, selected=False, zoom=1.0, pan_x=0.0, pan_y=0.0):
+    base_w, base_h = measure_node_base_size(canvas, node)
+
+    sx = node["x"] * zoom + pan_x
+    sy = node["y"] * zoom + pan_y
+    width = base_w * zoom
+    height = base_h * zoom
+    radius = NODE_RADIUS * zoom
+
+    font_size = max(4, int(round(11 * zoom)))
+    outline_w = max(1.0, (2.5 if selected else 2.0) * zoom)
     outline_color = NODE_SELECTED_OUTLINE if selected else NODE_OUTLINE
-    points = rounded_rect_points(x1, y1, x2, y2, NODE_RADIUS)
+
+    x1, y1 = sx - width / 2.0, sy - height / 2.0
+    x2, y2 = sx + width / 2.0, sy + height / 2.0
+
+    points = rounded_rect_points(x1, y1, x2, y2, radius)
     rect_id = canvas.create_polygon(
         points,
         smooth=True,
         splinesteps=24,
         fill=NODE_FILL,
         outline=outline_color,
-        width=2.5 if selected else 2,
+        width=outline_w,
+        tags=(tag, "node"),
+    )
+    text_id = canvas.create_text(
+        sx,
+        sy,
+        text=node["name"],
+        fill=NODE_TEXT,
+        font=("Segoe UI", font_size, "bold"),
         tags=(tag, "node"),
     )
     canvas.tag_raise(text_id, rect_id)
@@ -311,11 +342,20 @@ def draw_node(canvas, node, tag, selected=False):
     node["tag"] = tag
     node["rect_id"] = rect_id
     node["text_id"] = text_id
-    node["width"] = width
-    node["height"] = height
+    node["width"] = base_w
+    node["height"] = base_h
 
 
-def draw_connections(canvas, nodes, paths, method_colors, selected_node=None):
+def draw_connections(
+    canvas,
+    nodes,
+    paths,
+    method_colors,
+    selected_node=None,
+    zoom=1.0,
+    pan_x=0.0,
+    pan_y=0.0,
+):
     canvas.delete("connection")
     if not paths or not nodes:
         return
@@ -373,27 +413,37 @@ def draw_connections(canvas, nodes, paths, method_colors, selected_node=None):
 
         if selected_key is None:
             line_color = edge["color"]
-            line_width = LINE_WIDTH_NORMAL
-            arrow_shape = (11, 13, 5)
+            base_lw = LINE_WIDTH_NORMAL
+            base_arrow = (11, 13, 5)
         elif edge["connected"]:
             line_color = edge["color"]
-            line_width = LINE_WIDTH_SELECTED
-            arrow_shape = (13, 16, 6)
+            base_lw = LINE_WIDTH_SELECTED
+            base_arrow = (13, 16, 6)
         else:
             line_color = blend_colors(edge["color"], BG_COLOR, DIM_BLEND_FACTOR)
-            line_width = LINE_WIDTH_DIMMED
-            arrow_shape = (9, 11, 4)
+            base_lw = LINE_WIDTH_DIMMED
+            base_arrow = (9, 11, 4)
 
-        x1, y1 = src["x"], src["y"]
-        x2, y2 = dst["x"], dst["y"]
-        sw = src.get("width", NODE_MIN_W) / 2.0
-        sh = src.get("height", NODE_MIN_H) / 2.0
-        dw = dst.get("width", NODE_MIN_W) / 2.0
-        dh = dst.get("height", NODE_MIN_H) / 2.0
+        line_width = max(1.0, base_lw * zoom)
+        arrow_shape = (
+            max(4, int(round(base_arrow[0] * zoom))),
+            max(5, int(round(base_arrow[1] * zoom))),
+            max(2, int(round(base_arrow[2] * zoom))),
+        )
+
+        x1 = src["x"] * zoom + pan_x
+        y1 = src["y"] * zoom + pan_y
+        x2 = dst["x"] * zoom + pan_x
+        y2 = dst["y"] * zoom + pan_y
+
+        sw = (src.get("base_width", src.get("width", NODE_MIN_W)) * zoom) / 2.0
+        sh = (src.get("base_height", src.get("height", NODE_MIN_H)) * zoom) / 2.0
+        dw = (dst.get("base_width", dst.get("width", NODE_MIN_W)) * zoom) / 2.0
+        dh = (dst.get("base_height", dst.get("height", NODE_MIN_H)) * zoom) / 2.0
 
         # Self-loop fallback if an item is both input and output of the same path
         if src is dst:
-            loop_r = 28 + abs(edge["offset_index"]) * 10
+            loop_r = (28 + abs(edge["offset_index"]) * 10) * zoom
             sx = x1 + sw * 0.5
             sy = y1 - sh
             ex = x1 - sw * 0.5
@@ -432,10 +482,13 @@ def draw_connections(canvas, nodes, paths, method_colors, selected_node=None):
         else:
             px, py = uy, -ux
 
-        curve_offset = edge["offset_index"] * 26.0
+        curve_offset = edge["offset_index"] * 26.0 * zoom
+        start_pad = 2.0 * zoom
+        end_pad = 4.0 * zoom
+
         if abs(curve_offset) < 1e-3:
-            sx, sy = rect_border_point(x1, y1, sw, sh, ux, uy, pad=2.0)
-            ex, ey = rect_border_point(x2, y2, dw, dh, -ux, -uy, pad=4.0)
+            sx, sy = rect_border_point(x1, y1, sw, sh, ux, uy, pad=start_pad)
+            ex, ey = rect_border_point(x2, y2, dw, dh, -ux, -uy, pad=end_pad)
             canvas.create_line(
                 sx,
                 sy,
@@ -454,11 +507,11 @@ def draw_connections(canvas, nodes, paths, method_colors, selected_node=None):
 
             s_dx, s_dy = mx - x1, my - y1
             s_len = math.hypot(s_dx, s_dy) or 1.0
-            sx, sy = rect_border_point(x1, y1, sw, sh, s_dx / s_len, s_dy / s_len, pad=2.0)
+            sx, sy = rect_border_point(x1, y1, sw, sh, s_dx / s_len, s_dy / s_len, pad=start_pad)
 
             e_dx, e_dy = mx - x2, my - y2
             e_len = math.hypot(e_dx, e_dy) or 1.0
-            ex, ey = rect_border_point(x2, y2, dw, dh, e_dx / e_len, e_dy / e_len, pad=4.0)
+            ex, ey = rect_border_point(x2, y2, dw, dh, e_dx / e_len, e_dy / e_len, pad=end_pad)
 
             canvas.create_line(
                 sx,
@@ -481,24 +534,52 @@ def draw_connections(canvas, nodes, paths, method_colors, selected_node=None):
         canvas.tag_lower("connection", "node")
 
 
-def update_node_selection_visuals(canvas, nodes, selected_node):
+def update_node_selection_visuals(canvas, nodes, selected_node, zoom=1.0):
     for node in nodes:
         rect_id = node.get("rect_id")
         if rect_id:
             is_selected = node is selected_node
+            outline_w = max(1.0, (2.5 if is_selected else 2.0) * zoom)
             canvas.itemconfigure(
                 rect_id,
                 outline=NODE_SELECTED_OUTLINE if is_selected else NODE_OUTLINE,
-                width=2.5 if is_selected else 2,
+                width=outline_w,
             )
 
 
-def redraw_all(canvas, nodes, paths=None, method_colors=None, selected_node=None):
+def redraw_all(
+    canvas,
+    nodes,
+    paths=None,
+    method_colors=None,
+    selected_node=None,
+    zoom=1.0,
+    pan_x=0.0,
+    pan_y=0.0,
+):
     canvas.delete("node")
     for idx, node in enumerate(nodes):
-        draw_node(canvas, node, f"node_{idx}", selected=(node is selected_node))
+        tag = node.get("tag") or f"node_{idx + 1}"
+        draw_node(
+            canvas,
+            node,
+            tag,
+            selected=(node is selected_node),
+            zoom=zoom,
+            pan_x=pan_x,
+            pan_y=pan_y,
+        )
     if paths is not None and method_colors is not None:
-        draw_connections(canvas, nodes, paths, method_colors, selected_node)
+        draw_connections(
+            canvas,
+            nodes,
+            paths,
+            method_colors,
+            selected_node=selected_node,
+            zoom=zoom,
+            pan_x=pan_x,
+            pan_y=pan_y,
+        )
 
 
 class CreateItemTrackerApp:
@@ -512,7 +593,13 @@ class CreateItemTrackerApp:
         self.paths = []
         self.method_colors = {}
         self.next_id = 1
+
+        self.zoom = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+
         self.drag_state = {
+            "mode": None,  # "node" or "pan"
             "node": None,
             "start_x": 0,
             "start_y": 0,
@@ -523,28 +610,29 @@ class CreateItemTrackerApp:
         self.context_node = None
         self.selected_node = None
         self.form_visible = False
+        self.search_matches = []
 
         self._build_ui()
         self._load_initial_state()
 
     def _build_ui(self):
-        topbar = tk.Frame(self.root, bg=TOPBAR_BG, padx=12, pady=10)
-        topbar.pack(side=tk.TOP, fill=tk.X)
+        self.topbar = tk.Frame(self.root, bg=TOPBAR_BG, padx=12, pady=10)
+        self.topbar.pack(side=tk.TOP, fill=tk.X)
 
         self.entry = tk.Entry(
-            topbar,
+            self.topbar,
             bg=INPUT_BG,
             fg=INPUT_FG,
             insertbackground=INPUT_FG,
             relief=tk.FLAT,
             font=("Segoe UI", 11),
-            width=32,
+            width=26,
         )
-        self.entry.pack(side=tk.LEFT, ipady=6, padx=(0, 10))
+        self.entry.pack(side=tk.LEFT, ipady=6, padx=(0, 8))
         self.entry.bind("<Return>", lambda _event: self.add_item())
 
         add_btn = tk.Button(
-            topbar,
+            self.topbar,
             text="Add item",
             command=self.add_item,
             bg=BTN_BG,
@@ -560,6 +648,54 @@ class CreateItemTrackerApp:
         )
         add_btn.pack(side=tk.LEFT)
 
+        sep = tk.Frame(self.topbar, bg=PANEL_BORDER, width=1, height=26)
+        sep.pack(side=tk.LEFT, padx=14)
+
+        search_lbl = tk.Label(
+            self.topbar,
+            text="Search:",
+            bg=TOPBAR_BG,
+            fg=MUTED_FG,
+            font=("Segoe UI", 10, "bold"),
+        )
+        search_lbl.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.search_var = tk.StringVar()
+        self.search_entry = tk.Entry(
+            self.topbar,
+            textvariable=self.search_var,
+            bg=INPUT_BG,
+            fg=INPUT_FG,
+            insertbackground=INPUT_FG,
+            relief=tk.FLAT,
+            font=("Segoe UI", 11),
+            width=24,
+        )
+        self.search_entry.pack(side=tk.LEFT, ipady=6, padx=(0, 10))
+        self.search_entry.bind("<KeyRelease>", self._on_search_key_release)
+        self.search_entry.bind("<Down>", self._on_search_arrow_down)
+        self.search_entry.bind("<Up>", self._on_search_arrow_up)
+        self.search_entry.bind("<Return>", self._on_search_return)
+        self.search_entry.bind("<Escape>", lambda _e: self.hide_search_dropdown())
+        self.search_entry.bind("<FocusIn>", lambda _e: self.update_search_dropdown())
+
+        reset_view_btn = tk.Button(
+            self.topbar,
+            text="Reset view",
+            command=self.reset_view,
+            bg=SECONDARY_BTN_BG,
+            fg=INPUT_FG,
+            activebackground=SECONDARY_BTN_ACTIVE_BG,
+            activeforeground=BTN_FG,
+            relief=tk.FLAT,
+            bd=0,
+            padx=12,
+            pady=6,
+            font=("Segoe UI", 10, "bold"),
+            cursor="hand2",
+        )
+        reset_view_btn.pack(side=tk.RIGHT)
+
         self.main_area = tk.Frame(self.root, bg=BG_COLOR)
         self.main_area.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
@@ -573,6 +709,7 @@ class CreateItemTrackerApp:
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self._build_legend()
+        self._build_search_dropdown()
 
         self.context_menu = tk.Menu(
             self.root,
@@ -588,10 +725,45 @@ class CreateItemTrackerApp:
         self.canvas.bind("<B1-Motion>", self.on_left_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_left_release)
 
+        # Mouse wheel zoom (Windows/macOS <MouseWheel>, Linux X11 <Button-4>/<Button-5>)
+        self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
+        self.canvas.bind("<Button-4>", self.on_mouse_wheel_up)
+        self.canvas.bind("<Button-5>", self.on_mouse_wheel_down)
+
         # Support right-click across Windows/Linux (<Button-3>) and macOS (<Button-2> / Ctrl-Click)
         self.canvas.bind("<ButtonPress-3>", self.on_right_click)
         self.canvas.bind("<ButtonPress-2>", self.on_right_click)
         self.canvas.bind("<Control-Button-1>", self.on_right_click)
+
+        # Dismiss search dropdown when clicking outside search widgets
+        self.root.bind("<ButtonPress-1>", self._on_global_click, add="+")
+        self.root.bind("<Configure>", lambda _e: self._reposition_search_dropdown(), add="+")
+
+    def _build_search_dropdown(self):
+        self.search_dropdown = tk.Frame(
+            self.root,
+            bg=CARD_BG,
+            highlightbackground=PANEL_BORDER,
+            highlightthickness=1,
+        )
+        self.search_listbox = tk.Listbox(
+            self.search_dropdown,
+            bg=CARD_BG,
+            fg=NODE_TEXT,
+            selectbackground=BTN_BG,
+            selectforeground=BTN_FG,
+            activestyle="none",
+            relief=tk.FLAT,
+            bd=0,
+            highlightthickness=0,
+            font=("Segoe UI", 10),
+            exportselection=False,
+            cursor="hand2",
+        )
+        self.search_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.search_listbox.bind("<ButtonRelease-1>", self._on_search_listbox_click)
+        self.search_listbox.bind("<Return>", self._on_search_return)
+        self.search_listbox.bind("<Escape>", lambda _e: self.hide_search_dropdown())
 
     def _build_legend(self):
         self.legend_frame = tk.Frame(
@@ -843,6 +1015,194 @@ class CreateItemTrackerApp:
         bbox = self.paths_canvas.bbox("all")
         self.paths_canvas.configure(scrollregion=bbox if bbox else (0, 0, 0, 0))
 
+    def screen_to_world(self, sx, sy):
+        return (sx - self.pan_x) / self.zoom, (sy - self.pan_y) / self.zoom
+
+    def world_to_screen(self, wx, wy):
+        return wx * self.zoom + self.pan_x, wy * self.zoom + self.pan_y
+
+    def _redraw_scene(self):
+        redraw_all(
+            self.canvas,
+            self.nodes,
+            self.paths,
+            self.method_colors,
+            selected_node=self.selected_node,
+            zoom=self.zoom,
+            pan_x=self.pan_x,
+            pan_y=self.pan_y,
+        )
+
+    def _redraw_lines(self):
+        draw_connections(
+            self.canvas,
+            self.nodes,
+            self.paths,
+            self.method_colors,
+            selected_node=self.selected_node,
+            zoom=self.zoom,
+            pan_x=self.pan_x,
+            pan_y=self.pan_y,
+        )
+
+    def _apply_zoom_at(self, factor, pivot_sx, pivot_sy):
+        new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, self.zoom * factor))
+        if abs(new_zoom - self.zoom) < 1e-6:
+            return
+        world_x, world_y = self.screen_to_world(pivot_sx, pivot_sy)
+        self.zoom = new_zoom
+        self.pan_x = pivot_sx - world_x * self.zoom
+        self.pan_y = pivot_sy - world_y * self.zoom
+        self._redraw_scene()
+
+    def on_mouse_wheel(self, event):
+        if event.delta == 0:
+            return
+        steps = event.delta / 120.0 if abs(event.delta) >= 120 else (1.0 if event.delta > 0 else -1.0)
+        factor = ZOOM_STEP ** steps
+        self._apply_zoom_at(factor, event.x, event.y)
+
+    def on_mouse_wheel_up(self, event):
+        self._apply_zoom_at(ZOOM_STEP, event.x, event.y)
+
+    def on_mouse_wheel_down(self, event):
+        self._apply_zoom_at(1.0 / ZOOM_STEP, event.x, event.y)
+
+    def reset_view(self):
+        self.zoom = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self._redraw_scene()
+
+    def center_view_on_node(self, node):
+        self.root.update_idletasks()
+        cw = max(self.canvas.winfo_width(), 400)
+        ch = max(self.canvas.winfo_height(), 300)
+        self.pan_x = cw / 2.0 - node["x"] * self.zoom
+        self.pan_y = ch / 2.0 - node["y"] * self.zoom
+        self._redraw_scene()
+
+    # --- Search box & dropdown ---
+
+    def _on_search_key_release(self, event):
+        if event.keysym in ("Up", "Down", "Return", "Escape"):
+            return
+        self.update_search_dropdown()
+
+    def _reposition_search_dropdown(self):
+        if not self.search_dropdown.winfo_ismapped():
+            return
+        self.root.update_idletasks()
+        x = self.search_entry.winfo_rootx() - self.root.winfo_rootx()
+        y = (
+            self.search_entry.winfo_rooty()
+            - self.root.winfo_rooty()
+            + self.search_entry.winfo_height()
+            + 2
+        )
+        width = max(self.search_entry.winfo_width(), 200)
+        row_h = 22
+        visible_rows = min(8, max(1, len(self.search_matches)))
+        height = visible_rows * row_h + 6
+        self.search_dropdown.place(x=x, y=y, width=width, height=height)
+        self.search_dropdown.lift()
+
+    def update_search_dropdown(self):
+        query = self.search_var.get().strip().lower()
+        if not query:
+            self.hide_search_dropdown()
+            return
+
+        # Prioritize prefix matches first, then substring matches (both case-insensitive)
+        prefix_matches = []
+        substring_matches = []
+        for node in self.nodes:
+            low = node["name"].lower()
+            if low.startswith(query):
+                prefix_matches.append(node)
+            elif query in low:
+                substring_matches.append(node)
+
+        self.search_matches = prefix_matches + substring_matches
+        if not self.search_matches:
+            self.hide_search_dropdown()
+            return
+
+        self.search_listbox.delete(0, tk.END)
+        for node in self.search_matches:
+            self.search_listbox.insert(tk.END, node["name"])
+        self.search_listbox.selection_set(0)
+        self.search_listbox.activate(0)
+
+        self.search_dropdown.place(x=0, y=0)
+        self._reposition_search_dropdown()
+
+    def hide_search_dropdown(self):
+        self.search_matches = []
+        if self.search_dropdown.winfo_ismapped():
+            self.search_dropdown.place_forget()
+
+    def _on_search_arrow_down(self, _event):
+        if not self.search_matches:
+            self.update_search_dropdown()
+            return "break"
+        cur = self.search_listbox.curselection()
+        idx = (cur[0] + 1) % len(self.search_matches) if cur else 0
+        self.search_listbox.selection_clear(0, tk.END)
+        self.search_listbox.selection_set(idx)
+        self.search_listbox.activate(idx)
+        self.search_listbox.see(idx)
+        return "break"
+
+    def _on_search_arrow_up(self, _event):
+        if not self.search_matches:
+            return "break"
+        cur = self.search_listbox.curselection()
+        idx = (cur[0] - 1) % len(self.search_matches) if cur else len(self.search_matches) - 1
+        self.search_listbox.selection_clear(0, tk.END)
+        self.search_listbox.selection_set(idx)
+        self.search_listbox.activate(idx)
+        self.search_listbox.see(idx)
+        return "break"
+
+    def _on_search_return(self, _event=None):
+        if not self.search_matches:
+            query = self.search_var.get().strip()
+            if query:
+                exact = self._find_node_by_name(query)
+                if exact is not None:
+                    self._pick_search_node(exact)
+            return "break"
+        cur = self.search_listbox.curselection()
+        idx = cur[0] if cur else 0
+        if 0 <= idx < len(self.search_matches):
+            self._pick_search_node(self.search_matches[idx])
+        return "break"
+
+    def _on_search_listbox_click(self, event):
+        if not self.search_matches:
+            return
+        idx = self.search_listbox.nearest(event.y)
+        if 0 <= idx < len(self.search_matches):
+            self._pick_search_node(self.search_matches[idx])
+
+    def _pick_search_node(self, node):
+        self.search_var.set(node["name"])
+        self.hide_search_dropdown()
+        self.select_node(node)
+        self.center_view_on_node(node)
+        self.canvas.focus_set()
+
+    def _on_global_click(self, event):
+        if not self.search_dropdown.winfo_ismapped():
+            return
+        widget = event.widget
+        if widget in (self.search_entry, self.search_listbox, self.search_dropdown):
+            return
+        self.hide_search_dropdown()
+
+    # --- Persistence & state ---
+
     def _load_initial_state(self):
         loaded_nodes, loaded_paths, loaded_colors = load_data()
         self.paths = loaded_paths
@@ -856,7 +1216,15 @@ class CreateItemTrackerApp:
             }
             tag = f"node_{self.next_id}"
             self.next_id += 1
-            draw_node(self.canvas, node, tag)
+            draw_node(
+                self.canvas,
+                node,
+                tag,
+                selected=False,
+                zoom=self.zoom,
+                pan_x=self.pan_x,
+                pan_y=self.pan_y,
+            )
             self.nodes.append(node)
 
         # Ensure any items referenced by existing paths have nodes
@@ -876,16 +1244,8 @@ class CreateItemTrackerApp:
             self._save_state()
 
     def _save_state(self):
+        # node["x"] and node["y"] are always stored in normal (unzoomed) world coordinates
         save_data(self.nodes, self.paths, self.method_colors)
-
-    def _redraw_lines(self):
-        draw_connections(
-            self.canvas,
-            self.nodes,
-            self.paths,
-            self.method_colors,
-            self.selected_node,
-        )
 
     def _ensure_method_color(self, method_name):
         key = method_name.strip().lower()
@@ -975,8 +1335,8 @@ class CreateItemTrackerApp:
                 return node
         return None
 
-    def _find_node_at(self, x, y):
-        overlapping = self.canvas.find_overlapping(x, y, x, y)
+    def _find_node_at(self, sx, sy):
+        overlapping = self.canvas.find_overlapping(sx, sy, sx, sy)
         for item_id in reversed(overlapping):
             tags = self.canvas.gettags(item_id)
             for tag in tags:
@@ -995,8 +1355,8 @@ class CreateItemTrackerApp:
         half_w = width / 2.0 + margin
         half_h = height / 2.0 + margin
         for node in self.nodes:
-            nw = node.get("width", NODE_MIN_W) / 2.0
-            nh = node.get("height", NODE_MIN_H) / 2.0
+            nw = node.get("base_width", node.get("width", NODE_MIN_W)) / 2.0
+            nh = node.get("base_height", node.get("height", NODE_MIN_H)) / 2.0
             if abs(x - node["x"]) < (half_w + nw) and abs(y - node["y"]) < (half_h + nh):
                 return True
         return False
@@ -1007,25 +1367,30 @@ class CreateItemTrackerApp:
         canvas_h = max(self.canvas.winfo_height(), 500)
         est_w, est_h = self._estimate_node_size(name)
 
-        min_x = max(est_w / 2 + 20, 80)
-        max_x = max(min_x + 40, canvas_w - est_w / 2 - 20)
-        min_y = max(est_h / 2 + 20, 70)
-        max_y = max(min_y + 40, canvas_h - est_h / 2 - 20)
+        # Compute visible world bounds so newly added nodes appear in view at unzoomed world coords
+        vis_left, vis_top = self.screen_to_world(0, 0)
+        vis_right, vis_bottom = self.screen_to_world(canvas_w, canvas_h)
+
+        min_x = vis_left + est_w / 2.0 + 24
+        max_x = max(min_x + 80, vis_right - est_w / 2.0 - 24)
+        min_y = vis_top + est_h / 2.0 + 24
+        max_y = max(min_y + 80, vis_bottom - est_h / 2.0 - 24)
 
         if near_node is not None:
             cx, cy = near_node["x"], near_node["y"]
         else:
-            cx, cy = canvas_w / 2.0, canvas_h / 2.0
+            cx, cy = self.screen_to_world(canvas_w / 2.0, canvas_h / 2.0)
 
-        # Avoid the top-left legend region when placing nodes automatically
-        def in_legend_zone(px, py):
-            return px < 220 and py < 200
+        # Avoid the top-left legend region (in screen coordinates) when placing nodes
+        def in_legend_zone(wx, wy):
+            sx, sy = self.world_to_screen(wx, wy)
+            return sx < 220 and sy < 200
 
-        if not self.nodes and not in_legend_zone(cx, cy):
+        if not self._overlaps_existing(cx, cy, est_w, est_h) and not in_legend_zone(cx, cy):
             return cx, cy
 
-        # Search outward in concentric rings around the anchor/center
-        for ring in range(1, 18):
+        # Search outward in concentric rings in world coordinates
+        for ring in range(1, 20):
             radius_x = ring * 155
             radius_y = ring * 95
             steps = max(12, ring * 10)
@@ -1040,31 +1405,47 @@ class CreateItemTrackerApp:
                 if not self._overlaps_existing(cand_x, cand_y, est_w, est_h):
                     return cand_x, cand_y
 
-        # Grid scan across visible canvas if rings near anchor were tight
+        # Grid scan across visible world area
         col_step = max(140, int(est_w + 26))
         row_step = 76
-        for gy in range(int(min_y), int(max_y) + 1, row_step):
-            for gx in range(int(min_x), int(max_x) + 1, col_step):
-                if in_legend_zone(gx, gy):
-                    continue
-                if not self._overlaps_existing(gx, gy, est_w, est_h):
+        gx = min_x
+        while gx <= max_x:
+            gy = min_y
+            while gy <= max_y:
+                if not in_legend_zone(gx, gy) and not self._overlaps_existing(gx, gy, est_w, est_h):
                     return float(gx), float(gy)
+                gy += row_step
+            gx += col_step
 
-        # Fallback: place with tighter spacing if the canvas is very full
-        for gy in range(int(min_y), int(max_y) + 1, 56):
-            for gx in range(int(min_x), int(max_x) + 1, 110):
-                if not self._overlaps_existing(gx, gy, est_w, est_h, margin=6):
-                    return float(gx), float(gy)
+        # Unbounded ring fallback if visible viewport is completely full
+        for ring in range(1, 30):
+            radius_x = ring * 165
+            radius_y = ring * 105
+            steps = 16 + ring * 6
+            for step in range(steps):
+                angle = (2 * math.pi * step) / steps
+                cand_x = cx + math.cos(angle) * radius_x
+                cand_y = cy + math.sin(angle) * radius_y
+                if not self._overlaps_existing(cand_x, cand_y, est_w, est_h):
+                    return cand_x, cand_y
 
-        offset = (len(self.nodes) % 10) * 24
-        return min(max_x, min_x + offset), min(max_y, min_y + offset)
+        offset = (len(self.nodes) % 10) * 30
+        return cx + offset, cy + offset
 
     def _create_node(self, name, near_node=None):
         x, y = self._find_empty_position(name, near_node=near_node)
         node = {"name": name, "x": x, "y": y}
         tag = f"node_{self.next_id}"
         self.next_id += 1
-        draw_node(self.canvas, node, tag, selected=False)
+        draw_node(
+            self.canvas,
+            node,
+            tag,
+            selected=False,
+            zoom=self.zoom,
+            pan_x=self.pan_x,
+            pan_y=self.pan_y,
+        )
         self.nodes.append(node)
         return node
 
@@ -1081,7 +1462,7 @@ class CreateItemTrackerApp:
 
         node_changed = node is not self.selected_node
         self.selected_node = node
-        update_node_selection_visuals(self.canvas, self.nodes, self.selected_node)
+        update_node_selection_visuals(self.canvas, self.nodes, self.selected_node, zoom=self.zoom)
         self._redraw_lines()
 
         if not self.side_panel.winfo_ismapped():
@@ -1094,7 +1475,7 @@ class CreateItemTrackerApp:
 
     def close_side_panel(self):
         self.selected_node = None
-        update_node_selection_visuals(self.canvas, self.nodes, None)
+        update_node_selection_visuals(self.canvas, self.nodes, None, zoom=self.zoom)
         self._redraw_lines()
         self.hide_add_path_form()
         if self.side_panel.winfo_ismapped():
@@ -1168,6 +1549,8 @@ class CreateItemTrackerApp:
         self.refresh_legend()
         self.hide_add_path_form()
         self.refresh_side_panel_paths()
+        if self.search_dropdown.winfo_ismapped():
+            self.update_search_dropdown()
 
     def delete_path(self, path_obj):
         self.paths = [p for p in self.paths if p is not path_obj]
@@ -1270,6 +1653,8 @@ class CreateItemTrackerApp:
         self._create_node(name)
         self._redraw_lines()
         self._save_state()
+        if self.search_dropdown.winfo_ismapped():
+            self.update_search_dropdown()
 
         self.entry.delete(0, tk.END)
         self.entry.focus_set()
@@ -1279,19 +1664,19 @@ class CreateItemTrackerApp:
         node = self._find_node_at(event.x, event.y)
         if node is None:
             self.drag_state = {
+                "mode": "pan",
                 "node": None,
-                "start_x": 0,
-                "start_y": 0,
-                "last_x": 0,
-                "last_y": 0,
+                "start_x": event.x,
+                "start_y": event.y,
+                "last_x": event.x,
+                "last_y": event.y,
                 "dragging": False,
             }
-            if self.selected_node is not None:
-                self.close_side_panel()
             return
 
         self.canvas.tag_raise(node["tag"])
         self.drag_state = {
+            "mode": "node",
             "node": node,
             "start_x": event.x,
             "start_y": event.y,
@@ -1301,8 +1686,8 @@ class CreateItemTrackerApp:
         }
 
     def on_left_drag(self, event):
-        node = self.drag_state["node"]
-        if node is None:
+        mode = self.drag_state["mode"]
+        if mode is None:
             return
 
         if not self.drag_state["dragging"]:
@@ -1320,17 +1705,30 @@ class CreateItemTrackerApp:
         if dx == 0 and dy == 0:
             return
 
-        self.canvas.move(node["tag"], dx, dy)
-        node["x"] += dx
-        node["y"] += dy
         self.drag_state["last_x"] = event.x
         self.drag_state["last_y"] = event.y
-        self._redraw_lines()
+
+        if mode == "node":
+            node = self.drag_state["node"]
+            if node is None:
+                return
+            self.canvas.move(node["tag"], dx, dy)
+            # Store unzoomed world coordinates so zoom never alters saved layout
+            node["x"] += dx / self.zoom
+            node["y"] += dy / self.zoom
+            self._redraw_lines()
+        elif mode == "pan":
+            self.pan_x += dx
+            self.pan_y += dy
+            self.canvas.move("node", dx, dy)
+            self.canvas.move("connection", dx, dy)
 
     def on_left_release(self, _event):
+        mode = self.drag_state["mode"]
         node = self.drag_state["node"]
         was_dragging = self.drag_state["dragging"]
         self.drag_state = {
+            "mode": None,
             "node": None,
             "start_x": 0,
             "start_y": 0,
@@ -1339,11 +1737,14 @@ class CreateItemTrackerApp:
             "dragging": False,
         }
 
-        if node is not None:
+        if mode == "node" and node is not None:
             if was_dragging:
                 self._save_state()
             else:
                 self.select_node(node)
+        elif mode == "pan" and not was_dragging:
+            if self.selected_node is not None:
+                self.close_side_panel()
 
     def on_right_click(self, event):
         node = self._find_node_at(event.x, event.y)
@@ -1367,22 +1768,21 @@ class CreateItemTrackerApp:
         related_paths = [p for p in self.paths if path_involves_item(p, item_name)]
         count = len(related_paths)
 
-        if count == 0:
-            prompt = f'Delete "{item_name}"?\n\nThis will also delete 0 paths that use this item.'
-        elif count == 1:
-            prompt = f'Delete "{item_name}"?\n\nThis will also delete 1 path that uses this item.'
-        else:
-            prompt = f'Delete "{item_name}"?\n\nThis will also delete {count} paths that use this item.'
-
-        confirmed = messagebox.askyesno(
-            "Confirm Delete",
-            prompt,
-            parent=self.root,
-        )
-        if not confirmed:
-            return
-
+        # Only show confirmation when the node has one or more paths
         if count > 0:
+            if count == 1:
+                prompt = f'Delete "{item_name}"?\n\nThis will also delete 1 path that uses this item.'
+            else:
+                prompt = f'Delete "{item_name}"?\n\nThis will also delete {count} paths that use this item.'
+
+            confirmed = messagebox.askyesno(
+                "Confirm Delete",
+                prompt,
+                parent=self.root,
+            )
+            if not confirmed:
+                return
+
             related_ids = {id(p) for p in related_paths}
             self.paths = [p for p in self.paths if id(p) not in related_ids]
 
@@ -1396,6 +1796,8 @@ class CreateItemTrackerApp:
         self._redraw_lines()
         self.refresh_legend()
         self._save_state()
+        if self.search_dropdown.winfo_ismapped():
+            self.update_search_dropdown()
 
 
 def main():
