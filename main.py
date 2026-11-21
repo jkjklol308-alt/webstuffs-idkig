@@ -116,6 +116,26 @@ def blend_colors(fg_hex, bg_hex, factor):
     return rgb_to_hex(r, g, b)
 
 
+# --- Per-node custom colours (persisted in data.json) ---
+
+
+def node_fill_color(node):
+    """The node's custom colour if one is set and valid, otherwise the default."""
+    return _normalize_hex_color(node.get("color")) or NODE_FILL
+
+
+def best_text_color_for(bg_hex):
+    """Black or near-white text, whichever is easier to read on this background."""
+    r, g, b = hex_to_rgb(bg_hex)
+    yiq = (r * 299 + g * 587 + b * 114) / 1000.0
+    return "#000000" if yiq >= 128 else NODE_TEXT
+
+
+def dimmed_toward_background(hex_color):
+    """Blend a colour toward the canvas background (same as dimmed lines)."""
+    return blend_colors(hex_color, BG_COLOR, DIM_BLEND_FACTOR)
+
+
 def _parse_item_list(raw_items):
     if not isinstance(raw_items, list):
         return []
@@ -260,7 +280,12 @@ def load_data():
                 except (TypeError, ValueError):
                     x, y = 100.0, 100.0
                 seen_nodes.add(name.lower())
-                nodes.append({"name": name, "x": x, "y": y})
+                node_entry = {"name": name, "x": x, "y": y}
+                # Custom node colour, if one was saved (otherwise default applies)
+                color = _normalize_hex_color(entry.get("color"))
+                if color:
+                    node_entry["color"] = color
+                nodes.append(node_entry)
 
         method_colors = {}
         if isinstance(raw_colors, dict):
@@ -300,12 +325,18 @@ def load_data():
         return [], [], {}
 
 
+def _node_save_entry(node):
+    entry = {"name": node["name"], "x": round(node["x"], 2), "y": round(node["y"], 2)}
+    # Nodes without a custom colour are simply saved without a "color" key
+    color = _normalize_hex_color(node.get("color"))
+    if color:
+        entry["color"] = color
+    return entry
+
+
 def save_data(nodes, paths, method_colors):
     payload = {
-        "nodes": [
-            {"name": node["name"], "x": round(node["x"], 2), "y": round(node["y"], 2)}
-            for node in nodes
-        ],
+        "nodes": [_node_save_entry(node) for node in nodes],
         "paths": [
             {
                 "method": path["method"],
@@ -494,7 +525,7 @@ def measure_node_base_size(canvas, node):
     return base_w, base_h
 
 
-def draw_node(canvas, node, tag, selected=False, zoom=1.0, pan_x=0.0, pan_y=0.0):
+def draw_node(canvas, node, tag, selected=False, zoom=1.0, pan_x=0.0, pan_y=0.0, dimmed=False):
     base_w, base_h = measure_node_base_size(canvas, node)
     scale = node.get("scale") or NODE_SCALE_MIN
     # World-space size already includes the connection-driven scale
@@ -506,6 +537,14 @@ def draw_node(canvas, node, tag, selected=False, zoom=1.0, pan_x=0.0, pan_y=0.0)
     width = world_w * zoom
     height = world_h * zoom
     radius = NODE_RADIUS * zoom * scale
+
+    # Custom node colour (default when unset); text picks black/white for contrast
+    fill_color = node_fill_color(node)
+    text_color = best_text_color_for(fill_color)
+    if dimmed:
+        # Dimmed nodes blend toward the background, like the dimmed lines
+        fill_color = dimmed_toward_background(fill_color)
+        text_color = dimmed_toward_background(text_color)
 
     # Text grows together with the node (base text size * connection scale)
     font_size = max(4, int(round(NODE_FONT_SIZE * scale * zoom)))
@@ -520,7 +559,7 @@ def draw_node(canvas, node, tag, selected=False, zoom=1.0, pan_x=0.0, pan_y=0.0)
         points,
         smooth=True,
         splinesteps=24,
-        fill=NODE_FILL,
+        fill=fill_color,
         outline=outline_color,
         width=outline_w,
         tags=(tag, "node"),
@@ -529,7 +568,7 @@ def draw_node(canvas, node, tag, selected=False, zoom=1.0, pan_x=0.0, pan_y=0.0)
         sx,
         sy,
         text=node["name"],
-        fill=NODE_TEXT,
+        fill=text_color,
         font=(NODE_FONT_FAMILY, font_size, "bold"),
         tags=(tag, "node"),
     )
@@ -781,14 +820,25 @@ def draw_connections(
 def update_node_selection_visuals(canvas, nodes, selected_node, zoom=1.0):
     for node in nodes:
         rect_id = node.get("rect_id")
-        if rect_id:
-            is_selected = node is selected_node
-            outline_w = max(1.0, (2.5 if is_selected else 2.0) * zoom)
-            canvas.itemconfigure(
-                rect_id,
-                outline=NODE_SELECTED_OUTLINE if is_selected else NODE_OUTLINE,
-                width=outline_w,
-            )
+        if not rect_id:
+            continue
+        is_selected = node is selected_node
+        outline_w = max(1.0, (2.5 if is_selected else 2.0) * zoom)
+        fill_color = node_fill_color(node)
+        text_color = best_text_color_for(fill_color)
+        if selected_node is not None and not is_selected:
+            # Dimmed nodes blend toward the background, like the dimmed lines
+            fill_color = dimmed_toward_background(fill_color)
+            text_color = dimmed_toward_background(text_color)
+        canvas.itemconfigure(
+            rect_id,
+            fill=fill_color,
+            outline=NODE_SELECTED_OUTLINE if is_selected else NODE_OUTLINE,
+            width=outline_w,
+        )
+        text_id = node.get("text_id")
+        if text_id:
+            canvas.itemconfigure(text_id, fill=text_color)
 
 
 def redraw_all(
@@ -835,6 +885,7 @@ def redraw_all(
             zoom=zoom,
             pan_x=pan_x,
             pan_y=pan_y,
+            dimmed=(selected_node is not None and node is not selected_node),
         )
     if paths is not None and method_colors is not None:
         draw_connections(
@@ -993,6 +1044,9 @@ class CreateItemTrackerApp:
             activeforeground=BTN_FG,
         )
         self.context_menu.add_command(label="Delete", command=self.delete_context_node)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Change colour", command=self.change_context_node_color)
+        self.context_menu.add_command(label="Reset colour", command=self.reset_context_node_color)
 
         self.canvas.bind("<ButtonPress-1>", self.on_left_press)
         self.canvas.bind("<B1-Motion>", self.on_left_drag)
@@ -1582,6 +1636,9 @@ class CreateItemTrackerApp:
                 "y": entry["y"],
                 "tag": f"node_{self.next_id}",
             }
+            color = _normalize_hex_color(entry.get("color"))
+            if color:
+                node["color"] = color
             self.next_id += 1
             self.nodes.append(node)
 
@@ -2173,6 +2230,36 @@ class CreateItemTrackerApp:
         self._save_state()
         if self.search_dropdown.winfo_ismapped():
             self.update_search_dropdown()
+
+    def change_context_node_color(self):
+        node = self.context_node
+        if node is None:
+            return
+        chosen = colorchooser.askcolor(
+            color=node_fill_color(node),
+            title=f"Choose colour for {node['name']}",
+            parent=self.root,
+        )
+        if chosen and chosen[1]:
+            hex_color = _normalize_hex_color(chosen[1])
+            if hex_color:
+                node["color"] = hex_color
+                self._save_state()
+                # Apply immediately (respects the current dim/highlight state)
+                update_node_selection_visuals(
+                    self.canvas, self.nodes, self.selected_node, zoom=self.zoom
+                )
+
+    def reset_context_node_color(self):
+        node = self.context_node
+        if node is None:
+            return
+        if node.get("color") is not None:
+            node.pop("color", None)
+            self._save_state()
+            update_node_selection_visuals(
+                self.canvas, self.nodes, self.selected_node, zoom=self.zoom
+            )
 
 
 def main():
