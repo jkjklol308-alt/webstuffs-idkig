@@ -32,6 +32,19 @@ NODE_PAD_X = 18
 NODE_PAD_Y = 12
 NODE_MIN_W = 110
 NODE_MIN_H = 44
+NODE_FONT_FAMILY = "Segoe UI"
+NODE_FONT_SIZE = 11
+
+# Node size grows with the number of connection lines touching it (in + out).
+# A node with 0 connections keeps its base text-fit size (scale 1.0); the scale
+# follows a gentle square-root curve and is capped so hubs get bigger but never
+# swallow the screen. Sizes are derived, never saved to data.json.
+NODE_SCALE_MIN = 1.0
+NODE_SCALE_MAX = 2.2
+NODE_DEGREE_NORMALIZE = 8.0
+
+# Extra screen pixels drawn around the viewport when culling off-screen items
+VIEW_MARGIN_PX = 120
 
 LINE_WIDTH_NORMAL = 2.2
 LINE_WIDTH_SELECTED = 4.0
@@ -276,6 +289,117 @@ def rect_border_point(cx, cy, half_w, half_h, dir_x, dir_y, pad=3.0):
     return cx + dir_x * t, cy + dir_y * t
 
 
+# --- Connection-driven node sizing (calculated, never persisted) ---
+
+
+def connection_degree_counts(paths):
+    """Count, per item name, how many lines go out of it plus into it.
+
+    Every (input, output) pair of a path is one directed line, so an input
+    item gains len(outputs) outgoing lines and an output item gains
+    len(inputs) incoming lines. An item that is both input and output of the
+    same path is counted for both directions (self-loop = 2).
+    """
+    counts = {}
+    for path in paths:
+        inputs = path.get("inputs", [])
+        outputs = path.get("outputs", [])
+        for name in inputs:
+            key = str(name).strip().lower()
+            if key:
+                counts[key] = counts.get(key, 0) + len(outputs)
+        for name in outputs:
+            key = str(name).strip().lower()
+            if key:
+                counts[key] = counts.get(key, 0) + len(inputs)
+    return counts
+
+
+def node_scale_for_degree(degree):
+    """Gentle square-root growth from NODE_SCALE_MIN up to the NODE_SCALE_MAX cap."""
+    if degree <= 0:
+        return NODE_SCALE_MIN
+    return min(NODE_SCALE_MAX, math.sqrt(1.0 + degree / NODE_DEGREE_NORMALIZE))
+
+
+def recalculate_node_sizes(canvas, nodes, paths):
+    """Recompute every node's connection count, scale and world size in place.
+
+    Sizes are derived from the current paths on every call, so they update
+    immediately whenever a path is added or deleted. Only name/x/y are ever
+    written to data.json.
+    """
+    counts = connection_degree_counts(paths)
+    for node in nodes:
+        key = node["name"].strip().lower()
+        degree = counts.get(key, 0)
+        node["connections"] = degree
+        scale = node_scale_for_degree(degree)
+        node["scale"] = scale
+        base_w, base_h = measure_node_base_size(canvas, node)
+        node["base_width"] = base_w
+        node["base_height"] = base_h
+        node["width"] = base_w * scale
+        node["height"] = base_h * scale
+
+
+# --- Infinite-canvas viewport culling ---
+
+
+def visible_world_rect(view_w, view_h, zoom, pan_x, pan_y, margin=VIEW_MARGIN_PX):
+    """World-coordinate rectangle currently on screen, plus a small margin."""
+    if zoom <= 1e-6:
+        zoom = 1.0
+    x1 = (-margin - pan_x) / zoom
+    y1 = (-margin - pan_y) / zoom
+    x2 = (view_w + margin - pan_x) / zoom
+    y2 = (view_h + margin - pan_y) / zoom
+    return (x1, y1, x2, y2)
+
+
+def node_intersects_rect(node, rect):
+    """True if the node's (scaled) world-space box touches the given world rect."""
+    x1, y1, x2, y2 = rect
+    half_w = node.get("width", NODE_MIN_W) / 2.0
+    half_h = node.get("height", NODE_MIN_H) / 2.0
+    x = node["x"]
+    y = node["y"]
+    return not (x + half_w < x1 or x - half_w > x2 or y + half_h < y1 or y - half_h > y2)
+
+
+def segment_intersects_rect(x1, y1, x2, y2, rx1, ry1, rx2, ry2):
+    """True if the segment (x1,y1)-(x2,y2) touches or crosses the rect."""
+    if max(x1, x2) < rx1 or min(x1, x2) > rx2 or max(y1, y2) < ry1 or min(y1, y2) > ry2:
+        return False
+
+    def inside(x, y):
+        return rx1 <= x <= rx2 and ry1 <= y <= ry2
+
+    if inside(x1, y1) or inside(x2, y2):
+        return True
+
+    def cross(ox, oy, px, py, qx, qy):
+        return (px - ox) * (qy - oy) - (py - oy) * (qx - ox)
+
+    def segments_hit(ax, ay, bx, by, cx, cy, dx, dy):
+        d1 = cross(cx, cy, dx, dy, ax, ay)
+        d2 = cross(cx, cy, dx, dy, bx, by)
+        d3 = cross(ax, ay, bx, by, cx, cy)
+        d4 = cross(ax, ay, bx, by, dx, dy)
+        return ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0))
+
+    edges = (
+        (rx1, ry1, rx2, ry1),
+        (rx2, ry1, rx2, ry2),
+        (rx2, ry2, rx1, ry2),
+        (rx1, ry2, rx1, ry1),
+    )
+    for ex1, ey1, ex2, ey2 in edges:
+        if segments_hit(x1, y1, x2, y2, ex1, ey1, ex2, ey2):
+            return True
+    return False
+
+
 def measure_node_base_size(canvas, node):
     if "base_width" in node and "base_height" in node:
         return node["base_width"], node["base_height"]
@@ -284,7 +408,7 @@ def measure_node_base_size(canvas, node):
         0,
         0,
         text=node["name"],
-        font=("Segoe UI", 11, "bold"),
+        font=(NODE_FONT_FAMILY, NODE_FONT_SIZE, "bold"),
     )
     bbox = canvas.bbox(probe_id)
     canvas.delete(probe_id)
@@ -305,14 +429,19 @@ def measure_node_base_size(canvas, node):
 
 def draw_node(canvas, node, tag, selected=False, zoom=1.0, pan_x=0.0, pan_y=0.0):
     base_w, base_h = measure_node_base_size(canvas, node)
+    scale = node.get("scale") or NODE_SCALE_MIN
+    # World-space size already includes the connection-driven scale
+    world_w = node.get("width") or base_w * scale
+    world_h = node.get("height") or base_h * scale
 
     sx = node["x"] * zoom + pan_x
     sy = node["y"] * zoom + pan_y
-    width = base_w * zoom
-    height = base_h * zoom
-    radius = NODE_RADIUS * zoom
+    width = world_w * zoom
+    height = world_h * zoom
+    radius = NODE_RADIUS * zoom * scale
 
-    font_size = max(4, int(round(11 * zoom)))
+    # Text grows together with the node (base text size * connection scale)
+    font_size = max(4, int(round(NODE_FONT_SIZE * scale * zoom)))
     outline_w = max(1.0, (2.5 if selected else 2.0) * zoom)
     outline_color = NODE_SELECTED_OUTLINE if selected else NODE_OUTLINE
 
@@ -334,7 +463,7 @@ def draw_node(canvas, node, tag, selected=False, zoom=1.0, pan_x=0.0, pan_y=0.0)
         sy,
         text=node["name"],
         fill=NODE_TEXT,
-        font=("Segoe UI", font_size, "bold"),
+        font=(NODE_FONT_FAMILY, font_size, "bold"),
         tags=(tag, "node"),
     )
     canvas.tag_raise(text_id, rect_id)
@@ -342,8 +471,8 @@ def draw_node(canvas, node, tag, selected=False, zoom=1.0, pan_x=0.0, pan_y=0.0)
     node["tag"] = tag
     node["rect_id"] = rect_id
     node["text_id"] = text_id
-    node["width"] = base_w
-    node["height"] = base_h
+    node["width"] = world_w
+    node["height"] = world_h
 
 
 def draw_connections(
@@ -355,6 +484,7 @@ def draw_connections(
     zoom=1.0,
     pan_x=0.0,
     pan_y=0.0,
+    view_rect=None,
 ):
     canvas.delete("connection")
     if not paths or not nodes:
@@ -411,6 +541,15 @@ def draw_connections(
         src = edge["src"]
         dst = edge["dst"]
 
+        # Cull lines that cannot be seen: skip only when neither endpoint is
+        # visible AND the centre-to-centre segment misses the viewport rect
+        if view_rect is not None and not (
+            node_intersects_rect(src, view_rect)
+            or node_intersects_rect(dst, view_rect)
+            or segment_intersects_rect(src["x"], src["y"], dst["x"], dst["y"], *view_rect)
+        ):
+            continue
+
         if selected_key is None:
             line_color = edge["color"]
             base_lw = LINE_WIDTH_NORMAL
@@ -436,14 +575,18 @@ def draw_connections(
         x2 = dst["x"] * zoom + pan_x
         y2 = dst["y"] * zoom + pan_y
 
-        sw = (src.get("base_width", src.get("width", NODE_MIN_W)) * zoom) / 2.0
-        sh = (src.get("base_height", src.get("height", NODE_MIN_H)) * zoom) / 2.0
-        dw = (dst.get("base_width", dst.get("width", NODE_MIN_W)) * zoom) / 2.0
-        dh = (dst.get("base_height", dst.get("height", NODE_MIN_H)) * zoom) / 2.0
+        # Half sizes are the node's current (connection-scaled) world size,
+        # so lines attach to the node's edge, not its centre
+        sw = (src.get("width", src.get("base_width", NODE_MIN_W)) * zoom) / 2.0
+        sh = (src.get("height", src.get("base_height", NODE_MIN_H)) * zoom) / 2.0
+        dw = (dst.get("width", dst.get("base_width", NODE_MIN_W)) * zoom) / 2.0
+        dh = (dst.get("height", dst.get("base_height", NODE_MIN_H)) * zoom) / 2.0
 
         # Self-loop fallback if an item is both input and output of the same path
         if src is dst:
-            loop_r = (28 + abs(edge["offset_index"]) * 10) * zoom
+            loop_r = (28 + abs(edge["offset_index"]) * 10) * zoom * math.sqrt(
+                src.get("scale") or NODE_SCALE_MIN
+            )
             sx = x1 + sw * 0.5
             sy = y1 - sh
             ex = x1 - sw * 0.5
@@ -556,9 +699,31 @@ def redraw_all(
     zoom=1.0,
     pan_x=0.0,
     pan_y=0.0,
+    view_w=None,
+    view_h=None,
 ):
+    """Redraw the scene, creating canvas items only for what is on screen.
+
+    The canvas itself is infinite: there is no scrollregion and no fixed
+    bounds, so panning/zooming never hit an edge. view_rect (world coords,
+    already including a margin) decides what gets drawn; when the canvas has
+    not been mapped yet (size <= 1) everything is drawn.
+    """
     canvas.delete("node")
+    if view_w is None:
+        view_w = canvas.winfo_width()
+    if view_h is None:
+        view_h = canvas.winfo_height()
+    view_rect = None
+    if view_w > 1 and view_h > 1:
+        view_rect = visible_world_rect(view_w, view_h, zoom, pan_x, pan_y)
+
     for idx, node in enumerate(nodes):
+        if view_rect is not None and not node_intersects_rect(node, view_rect):
+            # Off-screen: draw nothing, leave no canvas items behind
+            node["rect_id"] = None
+            node["text_id"] = None
+            continue
         tag = node.get("tag") or f"node_{idx + 1}"
         draw_node(
             canvas,
@@ -579,6 +744,7 @@ def redraw_all(
             zoom=zoom,
             pan_x=pan_x,
             pan_y=pan_y,
+            view_rect=view_rect,
         )
 
 
@@ -611,6 +777,7 @@ class CreateItemTrackerApp:
         self.selected_node = None
         self.form_visible = False
         self.search_matches = []
+        self._redraw_pending = False
 
         self._build_ui()
         self._load_initial_state()
@@ -724,6 +891,9 @@ class CreateItemTrackerApp:
         self.canvas.bind("<ButtonPress-1>", self.on_left_press)
         self.canvas.bind("<B1-Motion>", self.on_left_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_left_release)
+
+        # Window/canvas resize changes the visible viewport, so re-cull and redraw
+        self.canvas.bind("<Configure>", lambda _e: self._schedule_redraw())
 
         # Mouse wheel zoom (Windows/macOS <MouseWheel>, Linux X11 <Button-4>/<Button-5>)
         self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
@@ -1021,7 +1191,20 @@ class CreateItemTrackerApp:
     def world_to_screen(self, wx, wy):
         return wx * self.zoom + self.pan_x, wy * self.zoom + self.pan_y
 
+    def _recalculate_sizes(self):
+        # Node sizes depend only on the current paths, so recompute them on
+        # every redraw: adding/deleting a path resizes nodes immediately
+        recalculate_node_sizes(self.canvas, self.nodes, self.paths)
+
+    def _current_view_rect(self):
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+        if w <= 1 or h <= 1:
+            return None  # canvas not mapped yet: draw everything
+        return visible_world_rect(w, h, self.zoom, self.pan_x, self.pan_y)
+
     def _redraw_scene(self):
+        self._recalculate_sizes()
         redraw_all(
             self.canvas,
             self.nodes,
@@ -1043,7 +1226,22 @@ class CreateItemTrackerApp:
             zoom=self.zoom,
             pan_x=self.pan_x,
             pan_y=self.pan_y,
+            view_rect=self._current_view_rect(),
         )
+
+    def _schedule_redraw(self):
+        # Coalesce bursts of pan/drag/resize events into one redraw per idle cycle
+        if self._redraw_pending:
+            return
+        self._redraw_pending = True
+        try:
+            self.canvas.after_idle(self._run_scheduled_redraw)
+        except tk.TclError:
+            self._redraw_pending = False
+
+    def _run_scheduled_redraw(self):
+        self._redraw_pending = False
+        self._redraw_scene()
 
     def _apply_zoom_at(self, factor, pivot_sx, pivot_sy):
         new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, self.zoom * factor))
@@ -1208,23 +1406,16 @@ class CreateItemTrackerApp:
         self.paths = loaded_paths
         self.method_colors = loaded_colors
 
+        # Positions are plain world coordinates; no canvas size or scroll
+        # region is involved, so empty space costs nothing
         for entry in loaded_nodes:
             node = {
                 "name": entry["name"],
                 "x": entry["x"],
                 "y": entry["y"],
+                "tag": f"node_{self.next_id}",
             }
-            tag = f"node_{self.next_id}"
             self.next_id += 1
-            draw_node(
-                self.canvas,
-                node,
-                tag,
-                selected=False,
-                zoom=self.zoom,
-                pan_x=self.pan_x,
-                pan_y=self.pan_y,
-            )
             self.nodes.append(node)
 
         # Ensure any items referenced by existing paths have nodes
@@ -1238,7 +1429,7 @@ class CreateItemTrackerApp:
                     self._create_node(name)
                     created_missing = True
 
-        self._redraw_lines()
+        self._redraw_scene()
         self.refresh_legend()
         if created_missing:
             self._save_state()
@@ -1355,8 +1546,9 @@ class CreateItemTrackerApp:
         half_w = width / 2.0 + margin
         half_h = height / 2.0 + margin
         for node in self.nodes:
-            nw = node.get("base_width", node.get("width", NODE_MIN_W)) / 2.0
-            nh = node.get("base_height", node.get("height", NODE_MIN_H)) / 2.0
+            # "width"/"height" are the current connection-scaled world sizes
+            nw = node.get("width", node.get("base_width", NODE_MIN_W)) / 2.0
+            nh = node.get("height", node.get("base_height", NODE_MIN_H)) / 2.0
             if abs(x - node["x"]) < (half_w + nw) and abs(y - node["y"]) < (half_h + nh):
                 return True
         return False
@@ -1434,18 +1626,13 @@ class CreateItemTrackerApp:
 
     def _create_node(self, name, near_node=None):
         x, y = self._find_empty_position(name, near_node=near_node)
-        node = {"name": name, "x": x, "y": y}
-        tag = f"node_{self.next_id}"
+        node = {
+            "name": name,
+            "x": x,
+            "y": y,
+            "tag": f"node_{self.next_id}",
+        }
         self.next_id += 1
-        draw_node(
-            self.canvas,
-            node,
-            tag,
-            selected=False,
-            zoom=self.zoom,
-            pan_x=self.pan_x,
-            pan_y=self.pan_y,
-        )
         self.nodes.append(node)
         return node
 
@@ -1545,7 +1732,8 @@ class CreateItemTrackerApp:
         )
 
         self._save_state()
-        self._redraw_lines()
+        # Full redraw recalculates node sizes from the new path right away
+        self._redraw_scene()
         self.refresh_legend()
         self.hide_add_path_form()
         self.refresh_side_panel_paths()
@@ -1555,7 +1743,8 @@ class CreateItemTrackerApp:
     def delete_path(self, path_obj):
         self.paths = [p for p in self.paths if p is not path_obj]
         self._save_state()
-        self._redraw_lines()
+        # Full redraw recalculates node sizes after the path is gone
+        self._redraw_scene()
         self.refresh_legend()
         self.refresh_side_panel_paths()
 
@@ -1651,7 +1840,7 @@ class CreateItemTrackerApp:
             return
 
         self._create_node(name)
-        self._redraw_lines()
+        self._redraw_scene()
         self._save_state()
         if self.search_dropdown.winfo_ismapped():
             self.update_search_dropdown()
@@ -1712,16 +1901,16 @@ class CreateItemTrackerApp:
             node = self.drag_state["node"]
             if node is None:
                 return
-            self.canvas.move(node["tag"], dx, dy)
             # Store unzoomed world coordinates so zoom never alters saved layout
             node["x"] += dx / self.zoom
             node["y"] += dy / self.zoom
-            self._redraw_lines()
+            self._schedule_redraw()
         elif mode == "pan":
+            # The canvas is infinite: panning just moves the viewport and the
+            # redraw draws whatever has come into view (and drops what left)
             self.pan_x += dx
             self.pan_y += dy
-            self.canvas.move("node", dx, dy)
-            self.canvas.move("connection", dx, dy)
+            self._schedule_redraw()
 
     def on_left_release(self, _event):
         mode = self.drag_state["mode"]
@@ -1791,9 +1980,10 @@ class CreateItemTrackerApp:
         elif self.selected_node is not None:
             self.refresh_side_panel_paths()
 
-        self.canvas.delete(node["tag"])
         self.nodes = [n for n in self.nodes if n is not node]
-        self._redraw_lines()
+        # Redraw removes the node's items and resizes the remaining nodes
+        # (their paths were deleted above, so their sizes shrink immediately)
+        self._redraw_scene()
         self.refresh_legend()
         self._save_state()
         if self.search_dropdown.winfo_ismapped():
