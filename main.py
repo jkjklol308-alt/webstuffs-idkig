@@ -57,6 +57,19 @@ LINE_WIDTH_SELECTED = 4.0
 LINE_WIDTH_DIMMED = 1.6
 DIM_BLEND_FACTOR = 0.25  # 25% method colour + 75% canvas background
 
+# Route finding (Shift+click two nodes, highlight every route between them).
+# Routes are capped so huge webs cannot freeze the app.
+ROUTE_MAX_STEPS = 15  # a route may use at most this many lines
+ROUTE_MAX_ROUTES = 100  # at most this many routes are collected
+ROUTE_HIGHLIGHT_COLOR = "#ffd166"  # bright ring/outline for endpoints and route items
+ROUTE_RING_PAD_PX = 6  # ring padding around endpoint nodes, in screen pixels
+ROUTE_RING_WIDTH_PX = 3
+ROUTE_OUTLINE_WIDTH = 3.2  # outline width of nodes on a route, screen px * zoom
+ROUTE_LINE_WIDTH = 5.0  # thicker line width for route lines (method colour kept)
+ROUTE_CASING_EXTRA = 3.5  # bright casing drawn under route lines, screen px * zoom
+
+SHIFT_MASK = 0x0001  # Tk modifier bit for the Shift key
+
 MIN_ZOOM = 0.25
 MAX_ZOOM = 3.0
 ZOOM_STEP = 1.12
@@ -134,6 +147,137 @@ def best_text_color_for(bg_hex):
 def dimmed_toward_background(hex_color):
     """Blend a colour toward the canvas background (same as dimmed lines)."""
     return blend_colors(hex_color, BG_COLOR, DIM_BLEND_FACTOR)
+
+
+# --- Route finding (Shift+click two nodes, then highlight every route between them) ---
+
+
+def _name_key(name):
+    return str(name).strip().lower()
+
+
+def _route_edge_key(path, in_name, out_name):
+    """Identity of one drawn line: the path object plus its input/output pair."""
+    return (id(path), _name_key(in_name), _name_key(out_name))
+
+
+def build_route_adjacency(paths, directed=True):
+    """Adjacency map of lines: src key -> list of edge dicts.
+
+    Each (input, output) pair of a path is one line, directed input -> output.
+    In undirected mode every line is additionally traversable backwards (the
+    copy is flagged "reversed"); that mode is only used when no directed
+    route exists at all.
+    """
+    adj = {}
+    for path in paths:
+        method = path.get("method", "")
+        for in_name in path.get("inputs", []):
+            for out_name in path.get("outputs", []):
+                fwd = {
+                    "src": str(in_name),
+                    "dst": str(out_name),
+                    "src_key": _name_key(in_name),
+                    "dst_key": _name_key(out_name),
+                    "method": method,
+                    "path": path,
+                    "in_name": in_name,
+                    "out_name": out_name,
+                    "reversed": False,
+                }
+                adj.setdefault(fwd["src_key"], []).append(fwd)
+                if not directed:
+                    rev = dict(fwd)
+                    rev["src"], rev["dst"] = fwd["dst"], fwd["src"]
+                    rev["src_key"], rev["dst_key"] = fwd["dst_key"], fwd["src_key"]
+                    rev["reversed"] = True
+                    adj.setdefault(rev["src_key"], []).append(rev)
+    return adj
+
+
+def search_routes(paths, start_name, end_name, directed=True,
+                  max_steps=ROUTE_MAX_STEPS, max_routes=ROUTE_MAX_ROUTES):
+    """All simple routes (no node used twice) from start to end.
+
+    Returns (routes, limit_hit). Each route is a list of edge dicts in
+    traversal order. A route is at most max_steps lines long, and at most
+    max_routes routes are collected (limit_hit=True when that cap was reached).
+    """
+    start_key = _name_key(start_name)
+    end_key = _name_key(end_name)
+    routes = []
+    if start_key == end_key:
+        return routes, False
+    adj = build_route_adjacency(paths, directed=directed)
+    limit_hit = False
+    visited = {start_key}
+    stack = []
+
+    def dfs(cur_key):
+        nonlocal limit_hit
+        if cur_key == end_key:
+            routes.append(list(stack))
+            if len(routes) >= max_routes:
+                limit_hit = True
+            return
+        if limit_hit or len(stack) >= max_steps:
+            return
+        for edge in adj.get(cur_key, []):
+            if limit_hit:
+                return
+            nxt = edge["dst_key"]
+            if nxt in visited:
+                continue
+            visited.add(nxt)
+            stack.append(edge)
+            dfs(nxt)
+            stack.pop()
+            visited.discard(nxt)
+
+    dfs(start_key)
+    return routes, limit_hit
+
+
+def find_routes(paths, start_name, end_name,
+                max_steps=ROUTE_MAX_STEPS, max_routes=ROUTE_MAX_ROUTES):
+    """Routes between two items, using the fallback order:
+
+    1. first -> second following line direction (input -> output)
+    2. if none: second -> first following line direction
+    3. if still none: ignore line direction (direction_ignored=True if routes found)
+    4. if still none: no routes at all
+
+    Returns (routes, direction_ignored, limit_hit).
+    """
+    routes, limit_hit = search_routes(
+        paths, start_name, end_name, directed=True,
+        max_steps=max_steps, max_routes=max_routes,
+    )
+    direction_ignored = False
+    if not routes:
+        routes, l2 = search_routes(
+            paths, end_name, start_name, directed=True,
+            max_steps=max_steps, max_routes=max_routes,
+        )
+        limit_hit = limit_hit or l2
+    if not routes:
+        routes, l2 = search_routes(
+            paths, start_name, end_name, directed=False,
+            max_steps=max_steps, max_routes=max_routes,
+        )
+        limit_hit = limit_hit or l2
+        direction_ignored = bool(routes)
+    return routes, direction_ignored, limit_hit
+
+
+def format_route(route):
+    """One route as a single line, e.g. 'Cobblestone -(Crushing)-> Gravel -(Washing)-> Sand'."""
+    if not route:
+        return ""
+    parts = [str(route[0]["src"])]
+    for edge in route:
+        parts.append(f"-({edge['method']})-> {edge['dst']}")
+    return " ".join(parts)
 
 
 def _parse_item_list(raw_items):
@@ -244,6 +388,27 @@ def set_edge_arrows(path, in_name, out_name, config):
         "start": bool(config.get("start", ARROW_START_DEFAULT)),
         "finish": bool(config.get("finish", ARROW_FINISH_DEFAULT)),
     }
+
+
+def prune_path_arrows(path):
+    """Drop arrowhead settings for input/output pairs no longer in the path.
+
+    Used when an item is removed from a path (node deletion or path editing):
+    line-end settings belong to the path, so pairs that vanished go with them.
+    """
+    arrows = path.get("arrows")
+    if not isinstance(arrows, dict):
+        return
+    valid = {
+        arrow_pair_key(i, o)
+        for i in path.get("inputs", [])
+        for o in path.get("outputs", [])
+    }
+    cleaned = {k: v for k, v in arrows.items() if k in valid}
+    if cleaned:
+        path["arrows"] = cleaned
+    else:
+        path.pop("arrows", None)
 
 
 def load_data():
@@ -525,7 +690,8 @@ def measure_node_base_size(canvas, node):
     return base_w, base_h
 
 
-def draw_node(canvas, node, tag, selected=False, zoom=1.0, pan_x=0.0, pan_y=0.0, dimmed=False):
+def draw_node(canvas, node, tag, selected=False, zoom=1.0, pan_x=0.0, pan_y=0.0,
+              dimmed=False, ring=False, highlighted=False):
     base_w, base_h = measure_node_base_size(canvas, node)
     scale = node.get("scale") or NODE_SCALE_MIN
     # World-space size already includes the connection-driven scale
@@ -548,8 +714,16 @@ def draw_node(canvas, node, tag, selected=False, zoom=1.0, pan_x=0.0, pan_y=0.0,
 
     # Text grows together with the node (base text size * connection scale)
     font_size = max(4, int(round(NODE_FONT_SIZE * scale * zoom)))
-    outline_w = max(1.0, (2.5 if selected else 2.0) * zoom)
-    outline_color = NODE_SELECTED_OUTLINE if selected else NODE_OUTLINE
+    if highlighted:
+        # Node on a route: bright outline, full (custom) fill colour
+        outline_w = max(1.5, ROUTE_OUTLINE_WIDTH * zoom)
+        outline_color = ROUTE_HIGHLIGHT_COLOR
+    elif selected:
+        outline_w = max(1.0, 2.5 * zoom)
+        outline_color = NODE_SELECTED_OUTLINE
+    else:
+        outline_w = max(1.0, 2.0 * zoom)
+        outline_color = NODE_OUTLINE
 
     x1, y1 = sx - width / 2.0, sy - height / 2.0
     x2, y2 = sx + width / 2.0, sy + height / 2.0
@@ -574,6 +748,25 @@ def draw_node(canvas, node, tag, selected=False, zoom=1.0, pan_x=0.0, pan_y=0.0,
     )
     canvas.tag_raise(text_id, rect_id)
 
+    # Bright outline ring around route endpoint nodes; padding is in screen
+    # pixels, so the ring keeps the same visible size at any zoom level
+    if ring:
+        pad = ROUTE_RING_PAD_PX * zoom
+        ring_points = rounded_rect_points(x1 - pad, y1 - pad, x2 + pad, y2 + pad, radius + pad)
+        ring_id = canvas.create_polygon(
+            ring_points,
+            smooth=True,
+            splinesteps=24,
+            fill="",
+            outline=ROUTE_HIGHLIGHT_COLOR,
+            width=max(2.0, ROUTE_RING_WIDTH_PX * zoom),
+            tags=(tag, "node"),
+        )
+        canvas.tag_raise(ring_id, rect_id)
+        node["ring_id"] = ring_id
+    else:
+        node["ring_id"] = None
+
     node["tag"] = tag
     node["rect_id"] = rect_id
     node["text_id"] = text_id
@@ -592,6 +785,8 @@ def draw_connections(
     pan_y=0.0,
     view_rect=None,
     edge_sink=None,
+    route_edge_keys=None,
+    routes_active=False,
 ):
     canvas.delete("connection")
     if edge_sink is not None:
@@ -626,6 +821,11 @@ def draw_connections(
                     and (src_key == selected_key or dst_key == selected_key)
                 )
 
+                on_route = bool(
+                    routes_active
+                    and route_edge_keys is not None
+                    and _route_edge_key(path, in_name, out_name) in route_edge_keys
+                )
                 edge = {
                     "src": src,
                     "dst": dst,
@@ -637,6 +837,9 @@ def draw_connections(
                     "path": path,
                     "in_name": in_name,
                     "out_name": out_name,
+                    "on_route": on_route,
+                    # Draw route lines last so they sit on top of dimmed lines
+                    "rank": (2 if on_route else 0) if routes_active else (1 if connected_to_selected else 0),
                 }
                 raw_edges.append(edge)
                 pair_key = tuple(sorted((src_key, dst_key)))
@@ -648,7 +851,7 @@ def draw_connections(
             edge["offset_index"] = idx - (count - 1) / 2.0
 
     # Draw dimmed/unselected lines first so highlighted lines sit cleanly on top of other lines
-    ordered_edges = sorted(raw_edges, key=lambda e: 1 if e["connected"] else 0)
+    ordered_edges = sorted(raw_edges, key=lambda e: e.get("rank", 0))
 
     def record_endpoints(edge, sx, sy, ex, ey):
         # Remember where each end landed on screen so clicks/hovers can find it
@@ -687,7 +890,18 @@ def draw_connections(
         else:
             arrow_mode = tk.NONE
 
-        if selected_key is None:
+        if routes_active:
+            if edge["on_route"]:
+                # Route line: thicker, keeping the line's method colour
+                line_color = edge["color"]
+                base_lw = ROUTE_LINE_WIDTH
+                base_arrow = (14, 17, 7)
+            else:
+                # Everything not on a route dims toward the background
+                line_color = blend_colors(edge["color"], BG_COLOR, DIM_BLEND_FACTOR)
+                base_lw = LINE_WIDTH_DIMMED
+                base_arrow = (9, 11, 4)
+        elif selected_key is None:
             line_color = edge["color"]
             base_lw = LINE_WIDTH_NORMAL
             base_arrow = (11, 13, 5)
@@ -771,6 +985,18 @@ def draw_connections(
             sx, sy = rect_border_point(x1, y1, sw, sh, ux, uy, pad=start_pad)
             ex, ey = rect_border_point(x2, y2, dw, dh, -ux, -uy, pad=end_pad)
             record_endpoints(edge, sx, sy, ex, ey)
+            if edge["on_route"]:
+                # Bright casing underneath the thicker method-coloured route line
+                canvas.create_line(
+                    sx,
+                    sy,
+                    ex,
+                    ey,
+                    fill=ROUTE_HIGHLIGHT_COLOR,
+                    width=max(1.0, (base_lw + ROUTE_CASING_EXTRA) * zoom),
+                    capstyle=tk.ROUND,
+                    tags=("connection",),
+                )
             canvas.create_line(
                 sx,
                 sy,
@@ -796,6 +1022,22 @@ def draw_connections(
             ex, ey = rect_border_point(x2, y2, dw, dh, e_dx / e_len, e_dy / e_len, pad=end_pad)
 
             record_endpoints(edge, sx, sy, ex, ey)
+            if edge["on_route"]:
+                # Bright casing underneath the thicker method-coloured route line
+                canvas.create_line(
+                    sx,
+                    sy,
+                    mx,
+                    my,
+                    ex,
+                    ey,
+                    smooth=True,
+                    splinesteps=20,
+                    fill=ROUTE_HIGHLIGHT_COLOR,
+                    width=max(1.0, (base_lw + ROUTE_CASING_EXTRA) * zoom),
+                    capstyle=tk.ROUND,
+                    tags=("connection",),
+                )
             canvas.create_line(
                 sx,
                 sy,
@@ -817,23 +1059,36 @@ def draw_connections(
         canvas.tag_lower("connection", "node")
 
 
-def update_node_selection_visuals(canvas, nodes, selected_node, zoom=1.0):
+def update_node_selection_visuals(canvas, nodes, selected_node, zoom=1.0,
+                                 route_node_keys=None, routes_active=False):
     for node in nodes:
         rect_id = node.get("rect_id")
         if not rect_id:
             continue
-        is_selected = node is selected_node
-        outline_w = max(1.0, (2.5 if is_selected else 2.0) * zoom)
+        key = node["name"].strip().lower()
+        highlighted = bool(routes_active and route_node_keys and key in route_node_keys)
+        is_selected = (node is selected_node) and not highlighted
+        if highlighted:
+            outline_w = max(1.5, ROUTE_OUTLINE_WIDTH * zoom)
+            outline_color = ROUTE_HIGHLIGHT_COLOR
+        elif is_selected:
+            outline_w = max(1.0, 2.5 * zoom)
+            outline_color = NODE_SELECTED_OUTLINE
+        else:
+            outline_w = max(1.0, 2.0 * zoom)
+            outline_color = NODE_OUTLINE
         fill_color = node_fill_color(node)
         text_color = best_text_color_for(fill_color)
-        if selected_node is not None and not is_selected:
+        if (routes_active and not highlighted) or (
+            not routes_active and selected_node is not None and not is_selected
+        ):
             # Dimmed nodes blend toward the background, like the dimmed lines
             fill_color = dimmed_toward_background(fill_color)
             text_color = dimmed_toward_background(text_color)
         canvas.itemconfigure(
             rect_id,
             fill=fill_color,
-            outline=NODE_SELECTED_OUTLINE if is_selected else NODE_OUTLINE,
+            outline=outline_color,
             width=outline_w,
         )
         text_id = node.get("text_id")
@@ -853,6 +1108,10 @@ def redraw_all(
     view_w=None,
     view_h=None,
     edge_sink=None,
+    route_node_keys=None,
+    route_point_keys=None,
+    route_edge_keys=None,
+    routes_active=False,
 ):
     """Redraw the scene, creating canvas items only for what is on screen.
 
@@ -875,8 +1134,18 @@ def redraw_all(
             # Off-screen: draw nothing, leave no canvas items behind
             node["rect_id"] = None
             node["text_id"] = None
+            node["ring_id"] = None
             continue
         tag = node.get("tag") or f"node_{idx + 1}"
+        key = node["name"].strip().lower()
+        ring = bool(route_point_keys and key in route_point_keys)
+        highlighted = bool(routes_active and route_node_keys and key in route_node_keys)
+        if routes_active:
+            # Route highlight mode: nodes on a route stay bright, everything else dims
+            dimmed = not highlighted
+        else:
+            highlighted = False
+            dimmed = selected_node is not None and node is not selected_node
         draw_node(
             canvas,
             node,
@@ -885,7 +1154,9 @@ def redraw_all(
             zoom=zoom,
             pan_x=pan_x,
             pan_y=pan_y,
-            dimmed=(selected_node is not None and node is not selected_node),
+            dimmed=dimmed,
+            ring=ring,
+            highlighted=highlighted,
         )
     if paths is not None and method_colors is not None:
         draw_connections(
@@ -899,6 +1170,8 @@ def redraw_all(
             pan_y=pan_y,
             view_rect=view_rect,
             edge_sink=edge_sink,
+            route_edge_keys=route_edge_keys,
+            routes_active=routes_active,
         )
 
 
@@ -930,11 +1203,23 @@ class CreateItemTrackerApp:
         self.context_node = None
         self.selected_node = None
         self.form_visible = False
+        self.editing_path = None  # path currently open in the form for editing (None = adding new)
         self.search_matches = []
         self._redraw_pending = False
         self._drawn_edges = []  # drawn lines with their screen-space end points
         self._last_mouse = None
         self._hovering_end = False
+
+        # Route finding (Shift+click two nodes): endpoints, found routes, highlight sets
+        self.route_start = None
+        self.route_end = None
+        self.routes = []
+        self.route_direction_ignored = False
+        self.route_limit_hit = False
+        self._route_node_keys = set()
+        self._route_edge_keys = set()
+        self._route_point_keys = set()
+        self._status_after_id = None
 
         self._build_ui()
         self._load_initial_state()
@@ -1065,6 +1350,22 @@ class CreateItemTrackerApp:
         self.canvas.bind("<ButtonPress-3>", self.on_right_click)
         self.canvas.bind("<ButtonPress-2>", self.on_right_click)
         self.canvas.bind("<Control-Button-1>", self.on_right_click)
+
+        # Escape clears any active route selection and highlighting
+        self.root.bind("<Escape>", self._on_escape_key, add="+")
+
+        # Small status message overlaid at the bottom-left of the canvas
+        self.status_label = tk.Label(
+            self.canvas,
+            text="",
+            bg=TOPBAR_BG,
+            fg=NODE_TEXT,
+            font=("Segoe UI", 10, "bold"),
+            padx=10,
+            pady=5,
+            highlightbackground=PANEL_BORDER,
+            highlightthickness=1,
+        )
 
         # Dismiss search dropdown when clicking outside search widgets
         self.root.bind("<ButtonPress-1>", self._on_global_click, add="+")
@@ -1262,7 +1563,7 @@ class CreateItemTrackerApp:
         form_btns = tk.Frame(self.form_frame, bg=CARD_BG)
         form_btns.pack(side=tk.TOP, fill=tk.X)
 
-        save_path_btn = tk.Button(
+        self.save_path_btn = tk.Button(
             form_btns,
             text="Save path",
             command=self.submit_add_path_form,
@@ -1277,7 +1578,7 @@ class CreateItemTrackerApp:
             font=("Segoe UI", 9, "bold"),
             cursor="hand2",
         )
-        save_path_btn.pack(side=tk.LEFT)
+        self.save_path_btn.pack(side=tk.LEFT)
 
         cancel_path_btn = tk.Button(
             form_btns,
@@ -1364,6 +1665,20 @@ class CreateItemTrackerApp:
             return None  # canvas not mapped yet: draw everything
         return visible_world_rect(w, h, self.zoom, self.pan_x, self.pan_y)
 
+    def _route_draw_kwargs(self):
+        return {
+            "route_node_keys": self._route_node_keys,
+            "route_point_keys": self._route_point_keys,
+            "route_edge_keys": self._route_edge_keys,
+            "routes_active": bool(self.routes),
+        }
+
+    def _node_visual_kwargs(self):
+        return {
+            "route_node_keys": self._route_node_keys,
+            "routes_active": bool(self.routes),
+        }
+
     def _redraw_scene(self):
         self._recalculate_sizes()
         redraw_all(
@@ -1376,6 +1691,7 @@ class CreateItemTrackerApp:
             pan_x=self.pan_x,
             pan_y=self.pan_y,
             edge_sink=self._drawn_edges,
+            **self._route_draw_kwargs(),
         )
         self._update_hover()
 
@@ -1391,6 +1707,8 @@ class CreateItemTrackerApp:
             pan_y=self.pan_y,
             view_rect=self._current_view_rect(),
             edge_sink=self._drawn_edges,
+            route_edge_keys=self._route_edge_keys,
+            routes_active=bool(self.routes),
         )
         self._update_hover()
 
@@ -1407,6 +1725,205 @@ class CreateItemTrackerApp:
     def _run_scheduled_redraw(self):
         self._redraw_pending = False
         self._redraw_scene()
+
+    # --- Route finding: Shift+click two nodes to highlight every route between them ---
+
+    def show_status(self, message, auto_hide_ms=6000):
+        """Small status message overlaid at the bottom-left of the canvas."""
+        self.status_label.configure(text=message)
+        self.status_label.place(relx=0.0, rely=1.0, x=14, y=-12, anchor="sw")
+        self.status_label.lift()
+        if self._status_after_id is not None:
+            try:
+                self.root.after_cancel(self._status_after_id)
+            except tk.TclError:
+                pass
+        self._status_after_id = None
+        if auto_hide_ms:
+            self._status_after_id = self.root.after(auto_hide_ms, self.hide_status)
+
+    def hide_status(self):
+        self._status_after_id = None
+        self.status_label.place_forget()
+
+    def _on_escape_key(self, _event=None):
+        if self.route_start is not None or self.routes:
+            self.clear_route_selection()
+
+    def _on_shift_click_node(self, node):
+        """Shift+click marks route endpoints. It never drags the node and never
+        opens the node's normal side panel."""
+        if self.route_start is not None and self.route_end is not None:
+            # Shift+click on a third node: start a new selection with it as the first point
+            self.route_start = node
+            self.route_end = None
+            self.routes = []
+            self.route_direction_ignored = False
+            self.route_limit_hit = False
+            self.show_status(
+                f"Route start: {node['name']} — Shift+click a second node",
+                auto_hide_ms=4000,
+            )
+        elif self.route_start is None:
+            self.route_start = node
+            self.show_status(
+                f"Route start: {node['name']} — Shift+click a second node",
+                auto_hide_ms=4000,
+            )
+        elif node is self.route_start:
+            return  # clicking the first point again changes nothing
+        else:
+            self.route_end = node
+            self._compute_routes()
+        self._after_route_change()
+
+    def _compute_routes(self):
+        a = self.route_start["name"]
+        b = self.route_end["name"]
+        self.routes, self.route_direction_ignored, self.route_limit_hit = find_routes(
+            self.paths, a, b
+        )
+        if self.routes:
+            if self.route_direction_ignored:
+                msg = (
+                    f"No directed route {a} \u2192 {b}; ignoring line direction — "
+                    f"{len(self.routes)} route(s) found"
+                )
+            elif _name_key(self.routes[0][0]["src"]) == _name_key(a):
+                msg = f"Found {len(self.routes)} route(s) from {a} to {b}"
+            else:
+                msg = f"No route {a} \u2192 {b}; found {len(self.routes)} route(s) from {b} to {a}"
+            if self.route_limit_hit:
+                msg += (
+                    f" (limit hit: max {ROUTE_MAX_ROUTES} routes, "
+                    f"{ROUTE_MAX_STEPS} steps each)"
+                )
+            self.show_status(msg)
+        else:
+            self.show_status("No route found", auto_hide_ms=8000)
+
+    def _after_route_change(self):
+        self._route_node_keys = set()
+        self._route_edge_keys = set()
+        for route in self.routes:
+            self._route_node_keys.add(_name_key(route[0]["src"]))
+            for edge in route:
+                self._route_node_keys.add(_name_key(edge["dst"]))
+                self._route_edge_keys.add(
+                    _route_edge_key(edge["path"], edge["in_name"], edge["out_name"])
+                )
+        self._route_point_keys = set()
+        if self.route_start is not None:
+            self._route_point_keys.add(_name_key(self.route_start["name"]))
+        if self.route_end is not None:
+            self._route_point_keys.add(_name_key(self.route_end["name"]))
+        # The routes list lives in the side panel once both points are marked
+        if self.route_end is not None and not self.side_panel.winfo_ismapped():
+            self.side_panel.pack(side=tk.RIGHT, fill=tk.Y, before=self.canvas)
+        if self.side_panel.winfo_ismapped():
+            self._render_route_panel()
+        self._redraw_scene()
+
+    def clear_route_selection(self, redraw=True):
+        had_routes = self.route_start is not None or bool(self.routes)
+        self.route_start = None
+        self.route_end = None
+        self.routes = []
+        self.route_direction_ignored = False
+        self.route_limit_hit = False
+        self._route_node_keys = set()
+        self._route_edge_keys = set()
+        self._route_point_keys = set()
+        self.hide_status()
+        if self.side_panel.winfo_ismapped():
+            if self.selected_node is None:
+                self.side_panel.pack_forget()
+            else:
+                self.refresh_side_panel_paths()
+        if had_routes and redraw:
+            self._redraw_scene()
+
+    def _refresh_routes_after_edit(self):
+        """Paths changed while a route selection is active: recompute the routes."""
+        if self.route_start is not None and self.route_end is not None:
+            self._compute_routes()
+            self._after_route_change()
+
+    def _render_route_panel(self):
+        for child in self.paths_list_frame.winfo_children():
+            child.destroy()
+        self.hide_add_path_form()
+        if self.route_start is not None and self.route_end is not None:
+            self.panel_title_label.configure(
+                text=f"Routes: {self.route_start['name']} \u2192 {self.route_end['name']}"
+            )
+        elif self.route_start is not None:
+            self.panel_title_label.configure(text=f"Route from {self.route_start['name']}")
+        else:
+            self.panel_title_label.configure(text="")
+        if self.route_start is None:
+            self._sync_paths_scrollregion()
+            return
+        if self.route_end is None:
+            hint = tk.Label(
+                self.paths_list_frame,
+                text="Shift+click a second node to find the routes between the two points.",
+                bg=PANEL_BG,
+                fg=MUTED_FG,
+                font=("Segoe UI", 10),
+                anchor="w",
+                justify=tk.LEFT,
+                wraplength=PANEL_WIDTH - 60,
+            )
+            hint.pack(side=tk.TOP, fill=tk.X, pady=(6, 0))
+        elif not self.routes:
+            note = "No route found between the two points."
+            if self.route_direction_ignored:
+                note += " (Line direction was ignored, but still no route.)"
+            lbl = tk.Label(
+                self.paths_list_frame,
+                text=note,
+                bg=PANEL_BG,
+                fg=MUTED_FG,
+                font=("Segoe UI", 10),
+                anchor="w",
+                justify=tk.LEFT,
+                wraplength=PANEL_WIDTH - 60,
+            )
+            lbl.pack(side=tk.TOP, fill=tk.X, pady=(6, 0))
+        else:
+            head = tk.Label(
+                self.paths_list_frame,
+                text=f"{len(self.routes)} route(s):",
+                bg=PANEL_BG,
+                fg=NODE_TEXT,
+                font=("Segoe UI", 10, "bold"),
+                anchor="w",
+            )
+            head.pack(side=tk.TOP, fill=tk.X, pady=(6, 4))
+            for route in self.routes:
+                card = tk.Frame(
+                    self.paths_list_frame,
+                    bg=CARD_BG,
+                    padx=10,
+                    pady=6,
+                    highlightbackground=PANEL_BORDER,
+                    highlightthickness=1,
+                )
+                card.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+                lbl = tk.Label(
+                    card,
+                    text=format_route(route),
+                    bg=CARD_BG,
+                    fg=NODE_TEXT,
+                    font=("Segoe UI", 9),
+                    anchor="w",
+                    justify=tk.LEFT,
+                    wraplength=PANEL_WIDTH - 90,
+                )
+                lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.paths_canvas.yview_moveto(0)
+        self._sync_paths_scrollregion()
 
     # --- Line-end arrowhead interaction ---
 
@@ -1873,7 +2390,9 @@ class CreateItemTrackerApp:
 
         node_changed = node is not self.selected_node
         self.selected_node = node
-        update_node_selection_visuals(self.canvas, self.nodes, self.selected_node, zoom=self.zoom)
+        update_node_selection_visuals(
+            self.canvas, self.nodes, self.selected_node, zoom=self.zoom, **self._node_visual_kwargs()
+        )
         self._redraw_lines()
 
         if not self.side_panel.winfo_ismapped():
@@ -1886,7 +2405,9 @@ class CreateItemTrackerApp:
 
     def close_side_panel(self):
         self.selected_node = None
-        update_node_selection_visuals(self.canvas, self.nodes, None, zoom=self.zoom)
+        update_node_selection_visuals(
+            self.canvas, self.nodes, None, zoom=self.zoom, **self._node_visual_kwargs()
+        )
         self._redraw_lines()
         self.hide_add_path_form()
         if self.side_panel.winfo_ismapped():
@@ -1895,6 +2416,9 @@ class CreateItemTrackerApp:
     def open_add_path_form(self):
         if self.selected_node is None:
             return
+        # "Add path" always creates a new path; editing goes through edit_path()
+        self.editing_path = None
+        self.save_path_btn.configure(text="Save path")
         if not self.form_visible:
             self.form_frame.pack(
                 side=tk.TOP,
@@ -1911,7 +2435,33 @@ class CreateItemTrackerApp:
         self.outputs_entry.delete(0, tk.END)
         self.method_entry.focus_set()
 
+    def edit_path(self, path_obj):
+        """Open the path form pre-filled with this path, so clicking a path card in
+        the side panel lets you change its method/inputs/outputs in place."""
+        if not self.side_panel.winfo_ismapped():
+            return
+        self.editing_path = path_obj
+        self.save_path_btn.configure(text="Save changes")
+        if not self.form_visible:
+            self.form_frame.pack(
+                side=tk.TOP,
+                fill=tk.X,
+                padx=14,
+                pady=(0, 10),
+                before=self.paths_container,
+            )
+            self.form_visible = True
+
+        self.method_entry.delete(0, tk.END)
+        self.method_entry.insert(0, path_obj["method"])
+        self.inputs_entry.delete(0, tk.END)
+        self.inputs_entry.insert(0, ", ".join(path_obj["inputs"]))
+        self.outputs_entry.delete(0, tk.END)
+        self.outputs_entry.insert(0, ", ".join(path_obj["outputs"]))
+        self.method_entry.focus_set()
+
     def hide_add_path_form(self):
+        self.editing_path = None
         if self.form_visible:
             self.form_frame.pack_forget()
             self.form_visible = False
@@ -1947,13 +2497,24 @@ class CreateItemTrackerApp:
             node = self._ensure_node(item_name, near_node=first_input_node)
             canonical_outputs.append(node["name"])
 
-        self.paths.append(
-            {
-                "method": canonical_method,
-                "inputs": canonical_inputs,
-                "outputs": canonical_outputs,
-            }
-        )
+        editing = self.editing_path
+        is_editing = editing is not None and any(p is editing for p in self.paths)
+        if is_editing:
+            # Update the existing path in place instead of adding a duplicate
+            editing["method"] = canonical_method
+            editing["inputs"] = canonical_inputs
+            editing["outputs"] = canonical_outputs
+            # Arrowhead settings for input/output pairs that no longer exist are dropped
+            prune_path_arrows(editing)
+        else:
+            self.paths.append(
+                {
+                    "method": canonical_method,
+                    "inputs": canonical_inputs,
+                    "outputs": canonical_outputs,
+                }
+            )
+        self.editing_path = None
 
         self._save_state()
         # Full redraw recalculates node sizes from the new path right away
@@ -1961,18 +2522,28 @@ class CreateItemTrackerApp:
         self.refresh_legend()
         self.hide_add_path_form()
         self.refresh_side_panel_paths()
+        self._refresh_routes_after_edit()
         if self.search_dropdown.winfo_ismapped():
             self.update_search_dropdown()
 
     def delete_path(self, path_obj):
+        if self.editing_path is path_obj:
+            self.editing_path = None
+            self.hide_add_path_form()
         self.paths = [p for p in self.paths if p is not path_obj]
         self._save_state()
         # Full redraw recalculates node sizes after the path is gone
         self._redraw_scene()
         self.refresh_legend()
         self.refresh_side_panel_paths()
+        self._refresh_routes_after_edit()
 
     def refresh_side_panel_paths(self):
+        if self.route_start is not None:
+            # While a route selection is active the side panel lists the routes
+            self._render_route_panel()
+            return
+
         for child in self.paths_list_frame.winfo_children():
             child.destroy()
 
@@ -2047,6 +2618,11 @@ class CreateItemTrackerApp:
             )
             text_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
+            # Clicking the path card (anything but its Delete button) opens it for editing
+            for clickable in (card, dot, text_label):
+                clickable.bind("<Button-1>", lambda _e, p=path_obj: self.edit_path(p))
+                clickable.configure(cursor="hand2")
+
         self.paths_canvas.yview_moveto(0)
         self._sync_paths_scrollregion()
 
@@ -2074,6 +2650,27 @@ class CreateItemTrackerApp:
 
     def on_left_press(self, event):
         self.context_menu.unpost()
+
+        if event.state & SHIFT_MASK:
+            # Shift+click marks route endpoints only: it never drags the node
+            # and never opens the node's normal side panel
+            self.drag_state = {
+                "mode": None,
+                "node": None,
+                "start_x": 0,
+                "start_y": 0,
+                "last_x": 0,
+                "last_y": 0,
+                "dragging": False,
+            }
+            node = self._find_node_at(event.x, event.y)
+            if node is not None:
+                self._on_shift_click_node(node)
+            return
+
+        if self.route_start is not None:
+            # Any plain click (including on empty space) clears the route selection
+            self.clear_route_selection()
 
         # Clicking near a line end toggles the arrowhead on that end; clicking
         # anywhere else on a line or on a node behaves exactly as before
@@ -2195,16 +2792,39 @@ class CreateItemTrackerApp:
         node = self.context_node
         self.context_node = None
 
+        if node is self.route_start or node is self.route_end:
+            self.clear_route_selection(redraw=False)
+
         item_name = node["name"]
+        item_key = item_name.strip().lower()
         related_paths = [p for p in self.paths if path_involves_item(p, item_name)]
         count = len(related_paths)
 
         # Only show confirmation when the node has one or more paths
         if count > 0:
-            if count == 1:
-                prompt = f'Delete "{item_name}"?\n\nThis will also delete 1 path that uses this item.'
+            # Deleting an item only removes it from its paths; a path is
+            # deleted only when no inputs or no outputs would remain
+            def would_be_empty(p):
+                ins = [n for n in p["inputs"] if n.strip().lower() != item_key]
+                outs = [n for n in p["outputs"] if n.strip().lower() != item_key]
+                return not ins or not outs
+
+            dying = sum(1 for p in related_paths if would_be_empty(p))
+            if dying == count:
+                if count == 1:
+                    prompt = f'Delete "{item_name}"?\n\nThis will also delete 1 path that uses this item.'
+                else:
+                    prompt = f'Delete "{item_name}"?\n\nThis will also delete {count} paths that use this item.'
+            elif dying:
+                prompt = (
+                    f'Delete "{item_name}"?\n\nThis will remove it from {count - dying} path(s) '
+                    f'and delete {dying} path(s) that would be left empty.'
+                )
             else:
-                prompt = f'Delete "{item_name}"?\n\nThis will also delete {count} paths that use this item.'
+                prompt = (
+                    f'Delete "{item_name}"?\n\nThis will remove it from {count} path(s); '
+                    f'no paths are deleted.'
+                )
 
             confirmed = messagebox.askyesno(
                 "Confirm Delete",
@@ -2214,8 +2834,19 @@ class CreateItemTrackerApp:
             if not confirmed:
                 return
 
+            # Surgically remove the item from each related path instead of deleting
+            # whole paths, so other items sharing a path keep their lines
             related_ids = {id(p) for p in related_paths}
-            self.paths = [p for p in self.paths if id(p) not in related_ids]
+            new_paths = []
+            for p in self.paths:
+                if id(p) in related_ids:
+                    p["inputs"] = [n for n in p["inputs"] if n.strip().lower() != item_key]
+                    p["outputs"] = [n for n in p["outputs"] if n.strip().lower() != item_key]
+                    prune_path_arrows(p)
+                    if not (p["inputs"] and p["outputs"]):
+                        continue  # path would have no inputs/outputs left: delete it
+                new_paths.append(p)
+            self.paths = new_paths
 
         if node is self.selected_node:
             self.close_side_panel()
@@ -2247,7 +2878,8 @@ class CreateItemTrackerApp:
                 self._save_state()
                 # Apply immediately (respects the current dim/highlight state)
                 update_node_selection_visuals(
-                    self.canvas, self.nodes, self.selected_node, zoom=self.zoom
+                    self.canvas, self.nodes, self.selected_node, zoom=self.zoom,
+                    **self._node_visual_kwargs(),
                 )
 
     def reset_context_node_color(self):
@@ -2258,7 +2890,8 @@ class CreateItemTrackerApp:
             node.pop("color", None)
             self._save_state()
             update_node_selection_visuals(
-                self.canvas, self.nodes, self.selected_node, zoom=self.zoom
+                self.canvas, self.nodes, self.selected_node, zoom=self.zoom,
+                **self._node_visual_kwargs(),
             )
 
 
