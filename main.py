@@ -46,6 +46,12 @@ NODE_DEGREE_NORMALIZE = 8.0
 # Extra screen pixels drawn around the viewport when culling off-screen items
 VIEW_MARGIN_PX = 120
 
+# Line-end interaction: the click/hover circle around a line's end is measured
+# in screen pixels, so it stays a usable size at any zoom level
+END_HIT_RADIUS_PX = 14
+END_DOT_RADIUS_PX = 5
+END_DOT_COLOR = "#ffffff"
+
 LINE_WIDTH_NORMAL = 2.2
 LINE_WIDTH_SELECTED = 4.0
 LINE_WIDTH_DIMMED = 1.6
@@ -164,6 +170,62 @@ def pick_next_palette_color(existing_colors):
     return METHOD_PALETTE[len(existing_colors) % len(METHOD_PALETTE)].lower()
 
 
+# --- Per-line-end arrowhead settings (persisted inside each path in data.json) ---
+
+ARROW_START_DEFAULT = False  # start end (at the input node) has no arrowhead by default
+ARROW_FINISH_DEFAULT = True  # finish end (at the output node) has an arrowhead by default
+
+
+def arrow_pair_key(in_name, out_name):
+    """Stable key identifying one line: the path's input/output pair."""
+    return json.dumps([str(in_name).strip(), str(out_name).strip()], ensure_ascii=False)
+
+
+def normalize_arrow_config(value):
+    if not isinstance(value, dict):
+        return None
+    start = value.get("start", ARROW_START_DEFAULT)
+    finish = value.get("finish", ARROW_FINISH_DEFAULT)
+    if not isinstance(start, bool) or not isinstance(finish, bool):
+        return None
+    return {"start": start, "finish": finish}
+
+
+def normalize_arrows(raw):
+    """Keep only valid {pair_key: {"start": bool, "finish": bool}} entries."""
+    if not isinstance(raw, dict):
+        return {}
+    cleaned = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not key:
+            continue
+        cfg = normalize_arrow_config(value)
+        if cfg is not None:
+            cleaned[key] = cfg
+    return cleaned
+
+
+def get_edge_arrows(path, in_name, out_name):
+    """Arrowhead config for one line; defaults to a finish-end-only arrow."""
+    arrows = path.get("arrows")
+    if isinstance(arrows, dict):
+        cfg = normalize_arrow_config(arrows.get(arrow_pair_key(in_name, out_name)))
+        if cfg is not None:
+            return cfg
+    return {"start": ARROW_START_DEFAULT, "finish": ARROW_FINISH_DEFAULT}
+
+
+def set_edge_arrows(path, in_name, out_name, config):
+    arrows = path.get("arrows")
+    if not isinstance(arrows, dict):
+        arrows = {}
+        path["arrows"] = arrows
+    arrows[arrow_pair_key(in_name, out_name)] = {
+        "start": bool(config.get("start", ARROW_START_DEFAULT)),
+        "finish": bool(config.get("finish", ARROW_FINISH_DEFAULT)),
+    }
+
+
 def load_data():
     if not DATA_FILE.exists():
         return [], [], {}
@@ -221,13 +283,17 @@ def load_data():
                 mkey = method.lower()
                 if mkey not in method_colors:
                     method_colors[mkey] = pick_next_palette_color(method_colors)
-                paths.append(
-                    {
-                        "method": method,
-                        "inputs": inputs,
-                        "outputs": outputs,
-                    }
-                )
+                path_entry = {
+                    "method": method,
+                    "inputs": inputs,
+                    "outputs": outputs,
+                }
+                # Per-line arrowhead settings live inside the path, so deleting
+                # the path deletes them too
+                arrows = normalize_arrows(entry.get("arrows", {}))
+                if arrows:
+                    path_entry["arrows"] = arrows
+                paths.append(path_entry)
 
         return nodes, paths, method_colors
     except (OSError, json.JSONDecodeError):
@@ -245,6 +311,7 @@ def save_data(nodes, paths, method_colors):
                 "method": path["method"],
                 "inputs": list(path["inputs"]),
                 "outputs": list(path["outputs"]),
+                **({"arrows": normalize_arrows(path["arrows"])} if path.get("arrows") else {}),
             }
             for path in paths
         ],
@@ -485,8 +552,11 @@ def draw_connections(
     pan_x=0.0,
     pan_y=0.0,
     view_rect=None,
+    edge_sink=None,
 ):
     canvas.delete("connection")
+    if edge_sink is not None:
+        edge_sink.clear()
     if not paths or not nodes:
         return
 
@@ -524,6 +594,10 @@ def draw_connections(
                     "dst_key": dst_key,
                     "color": base_color,
                     "connected": connected_to_selected,
+                    # Identity of this line for arrowhead settings: path + input/output pair
+                    "path": path,
+                    "in_name": in_name,
+                    "out_name": out_name,
                 }
                 raw_edges.append(edge)
                 pair_key = tuple(sorted((src_key, dst_key)))
@@ -537,6 +611,19 @@ def draw_connections(
     # Draw dimmed/unselected lines first so highlighted lines sit cleanly on top of other lines
     ordered_edges = sorted(raw_edges, key=lambda e: 1 if e["connected"] else 0)
 
+    def record_endpoints(edge, sx, sy, ex, ey):
+        # Remember where each end landed on screen so clicks/hovers can find it
+        if edge_sink is not None:
+            edge_sink.append(
+                {
+                    "path": edge["path"],
+                    "in_name": edge["in_name"],
+                    "out_name": edge["out_name"],
+                    "start": (sx, sy),
+                    "finish": (ex, ey),
+                }
+            )
+
     for edge in ordered_edges:
         src = edge["src"]
         dst = edge["dst"]
@@ -549,6 +636,17 @@ def draw_connections(
             or segment_intersects_rect(src["x"], src["y"], dst["x"], dst["y"], *view_rect)
         ):
             continue
+
+        # Each end can independently show an arrowhead; default is finish-only
+        arrow_cfg = get_edge_arrows(edge["path"], edge["in_name"], edge["out_name"])
+        if arrow_cfg["start"] and arrow_cfg["finish"]:
+            arrow_mode = tk.BOTH
+        elif arrow_cfg["start"]:
+            arrow_mode = tk.FIRST
+        elif arrow_cfg["finish"]:
+            arrow_mode = tk.LAST
+        else:
+            arrow_mode = tk.NONE
 
         if selected_key is None:
             line_color = edge["color"]
@@ -591,6 +689,7 @@ def draw_connections(
             sy = y1 - sh
             ex = x1 - sw * 0.5
             ey = y1 - sh
+            record_endpoints(edge, sx, sy, ex, ey)
             canvas.create_line(
                 sx,
                 sy,
@@ -604,7 +703,7 @@ def draw_connections(
                 splinesteps=20,
                 fill=line_color,
                 width=line_width,
-                arrow=tk.LAST,
+                arrow=arrow_mode,
                 arrowshape=arrow_shape,
                 tags=("connection",),
             )
@@ -632,6 +731,7 @@ def draw_connections(
         if abs(curve_offset) < 1e-3:
             sx, sy = rect_border_point(x1, y1, sw, sh, ux, uy, pad=start_pad)
             ex, ey = rect_border_point(x2, y2, dw, dh, -ux, -uy, pad=end_pad)
+            record_endpoints(edge, sx, sy, ex, ey)
             canvas.create_line(
                 sx,
                 sy,
@@ -639,7 +739,7 @@ def draw_connections(
                 ey,
                 fill=line_color,
                 width=line_width,
-                arrow=tk.LAST,
+                arrow=arrow_mode,
                 arrowshape=arrow_shape,
                 capstyle=tk.ROUND,
                 tags=("connection",),
@@ -656,6 +756,7 @@ def draw_connections(
             e_len = math.hypot(e_dx, e_dy) or 1.0
             ex, ey = rect_border_point(x2, y2, dw, dh, e_dx / e_len, e_dy / e_len, pad=end_pad)
 
+            record_endpoints(edge, sx, sy, ex, ey)
             canvas.create_line(
                 sx,
                 sy,
@@ -667,7 +768,7 @@ def draw_connections(
                 splinesteps=20,
                 fill=line_color,
                 width=line_width,
-                arrow=tk.LAST,
+                arrow=arrow_mode,
                 arrowshape=arrow_shape,
                 capstyle=tk.ROUND,
                 tags=("connection",),
@@ -701,6 +802,7 @@ def redraw_all(
     pan_y=0.0,
     view_w=None,
     view_h=None,
+    edge_sink=None,
 ):
     """Redraw the scene, creating canvas items only for what is on screen.
 
@@ -745,6 +847,7 @@ def redraw_all(
             pan_x=pan_x,
             pan_y=pan_y,
             view_rect=view_rect,
+            edge_sink=edge_sink,
         )
 
 
@@ -778,6 +881,9 @@ class CreateItemTrackerApp:
         self.form_visible = False
         self.search_matches = []
         self._redraw_pending = False
+        self._drawn_edges = []  # drawn lines with their screen-space end points
+        self._last_mouse = None
+        self._hovering_end = False
 
         self._build_ui()
         self._load_initial_state()
@@ -891,6 +997,7 @@ class CreateItemTrackerApp:
         self.canvas.bind("<ButtonPress-1>", self.on_left_press)
         self.canvas.bind("<B1-Motion>", self.on_left_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_left_release)
+        self.canvas.bind("<Motion>", self.on_canvas_motion)
 
         # Window/canvas resize changes the visible viewport, so re-cull and redraw
         self.canvas.bind("<Configure>", lambda _e: self._schedule_redraw())
@@ -1214,7 +1321,9 @@ class CreateItemTrackerApp:
             zoom=self.zoom,
             pan_x=self.pan_x,
             pan_y=self.pan_y,
+            edge_sink=self._drawn_edges,
         )
+        self._update_hover()
 
     def _redraw_lines(self):
         draw_connections(
@@ -1227,7 +1336,9 @@ class CreateItemTrackerApp:
             pan_x=self.pan_x,
             pan_y=self.pan_y,
             view_rect=self._current_view_rect(),
+            edge_sink=self._drawn_edges,
         )
+        self._update_hover()
 
     def _schedule_redraw(self):
         # Coalesce bursts of pan/drag/resize events into one redraw per idle cycle
@@ -1242,6 +1353,62 @@ class CreateItemTrackerApp:
     def _run_scheduled_redraw(self):
         self._redraw_pending = False
         self._redraw_scene()
+
+    # --- Line-end arrowhead interaction ---
+
+    def _find_edge_end_at(self, sx, sy):
+        """Nearest drawn line end within END_HIT_RADIUS_PX of (sx, sy).
+
+        Returns (edge_info, "start"|"finish") or None. The radius is in screen
+        pixels, so the click area stays the same usable size at any zoom.
+        """
+        best = None
+        best_d2 = END_HIT_RADIUS_PX ** 2
+        for edge in self._drawn_edges:
+            for which, pos in (("start", edge["start"]), ("finish", edge["finish"])):
+                d2 = (sx - pos[0]) ** 2 + (sy - pos[1]) ** 2
+                if d2 <= best_d2:
+                    best_d2 = d2
+                    best = (edge, which)
+        return best
+
+    def _toggle_edge_end(self, edge, which):
+        """Flip the arrowhead on one end of a line and persist it."""
+        cfg = get_edge_arrows(edge["path"], edge["in_name"], edge["out_name"])
+        cfg[which] = not cfg[which]
+        set_edge_arrows(edge["path"], edge["in_name"], edge["out_name"], cfg)
+        self._save_state()  # saved per path + input/output pair; deleting the path deletes these
+        self._redraw_lines()
+
+    def on_canvas_motion(self, event):
+        self._last_mouse = (event.x, event.y)
+        self._update_hover()
+
+    def _update_hover(self):
+        """Hand cursor + a small dot when hovering near a line end."""
+        hit = self._find_edge_end_at(*self._last_mouse) if self._last_mouse else None
+        if hit is None:
+            if self._hovering_end:
+                self._hovering_end = False
+                self.canvas.configure(cursor="")
+            self.canvas.delete("end_hint")
+            return
+        edge, which = hit
+        pos = edge["start"] if which == "start" else edge["finish"]
+        self._hovering_end = True
+        self.canvas.configure(cursor="hand2")
+        self.canvas.delete("end_hint")
+        r = END_DOT_RADIUS_PX
+        self.canvas.create_oval(
+            pos[0] - r,
+            pos[1] - r,
+            pos[0] + r,
+            pos[1] + r,
+            fill=END_DOT_COLOR,
+            outline="",
+            tags=("end_hint",),
+        )
+        self.canvas.tag_raise("end_hint", "connection")
 
     def _apply_zoom_at(self, factor, pivot_sx, pivot_sy):
         new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, self.zoom * factor))
@@ -1850,6 +2017,24 @@ class CreateItemTrackerApp:
 
     def on_left_press(self, event):
         self.context_menu.unpost()
+
+        # Clicking near a line end toggles the arrowhead on that end; clicking
+        # anywhere else on a line or on a node behaves exactly as before
+        end_hit = self._find_edge_end_at(event.x, event.y)
+        if end_hit is not None:
+            edge, which = end_hit
+            self.drag_state = {
+                "mode": None,
+                "node": None,
+                "start_x": 0,
+                "start_y": 0,
+                "last_x": 0,
+                "last_y": 0,
+                "dragging": False,
+            }
+            self._toggle_edge_end(edge, which)
+            return
+
         node = self._find_node_at(event.x, event.y)
         if node is None:
             self.drag_state = {
