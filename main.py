@@ -3,7 +3,7 @@ import math
 import re
 from pathlib import Path
 import tkinter as tk
-from tkinter import colorchooser, messagebox
+from tkinter import colorchooser, messagebox, simpledialog
 
 
 DATA_FILE = Path(__file__).resolve().parent / "data.json"
@@ -27,6 +27,7 @@ DANGER_BTN_ACTIVE_BG = "#b62324"
 NODE_FILL = "#22272e"
 NODE_OUTLINE = "#444c56"
 NODE_SELECTED_OUTLINE = "#3b82f6"
+LIQUID_OUTLINE_COLOR = "#38bdf8"  # liquid items get a blue outline (fill colour unchanged)
 NODE_TEXT = "#f0f6fc"
 NODE_RADIUS = 12
 NODE_PAD_X = 18
@@ -162,46 +163,67 @@ def _route_edge_key(path, in_name, out_name):
     return (id(path), _name_key(in_name), _name_key(out_name))
 
 
-def build_route_adjacency(paths, directed=True):
-    """Adjacency map of lines: src key -> list of edge dicts.
+def edge_walk_directions(path, in_name, out_name):
+    """Which ways one line can be walked, decided by its arrowheads.
 
-    Each (input, output) pair of a path is one line, directed input -> output.
-    In undirected mode every line is additionally traversable backwards (the
-    copy is flagged "reversed"); that mode is only used when no directed
-    route exists at all.
+    A head at the finish end (the output side) lets a route walk input -> output;
+    a head at the start end (the input side) lets it walk output -> input; two
+    heads allow both; no heads mean the line cannot be walked at all.
+    """
+    cfg = get_edge_arrows(path, in_name, out_name)
+    return {"fwd": bool(cfg["finish"]), "rev": bool(cfg["start"])}
+
+
+def build_route_adjacency(paths):
+    """Adjacency of walkable recipe steps: node key -> list of step dicts.
+
+    Each step walks one recipe (path) from one of its inputs to one of its
+    outputs, in a direction the line's arrowheads allow ("walk": "fwd" =
+    input -> output, "rev" = output -> input). Outputs with a 0% chance are
+    never walked.
     """
     adj = {}
     for path in paths:
         method = path.get("method", "")
         for in_name in path.get("inputs", []):
             for out_name in path.get("outputs", []):
-                fwd = {
-                    "src": str(in_name),
-                    "dst": str(out_name),
-                    "src_key": _name_key(in_name),
-                    "dst_key": _name_key(out_name),
+                if output_chance(path, out_name) <= 0:
+                    continue  # a 0% output can never be produced, so never walked
+                base = {
                     "method": method,
                     "path": path,
-                    "in_name": in_name,
-                    "out_name": out_name,
-                    "reversed": False,
+                    "in_name": str(in_name),
+                    "out_name": str(out_name),
                 }
-                adj.setdefault(fwd["src_key"], []).append(fwd)
-                if not directed:
-                    rev = dict(fwd)
-                    rev["src"], rev["dst"] = fwd["dst"], fwd["src"]
-                    rev["src_key"], rev["dst_key"] = fwd["dst_key"], fwd["src_key"]
-                    rev["reversed"] = True
-                    adj.setdefault(rev["src_key"], []).append(rev)
+                walk = edge_walk_directions(path, in_name, out_name)
+                if walk["fwd"]:
+                    adj.setdefault(_name_key(in_name), []).append({
+                        **base,
+                        "src": str(in_name),
+                        "dst": str(out_name),
+                        "src_key": _name_key(in_name),
+                        "dst_key": _name_key(out_name),
+                        "walk": "fwd",
+                    })
+                if walk["rev"]:
+                    adj.setdefault(_name_key(out_name), []).append({
+                        **base,
+                        "src": str(out_name),
+                        "dst": str(in_name),
+                        "src_key": _name_key(out_name),
+                        "dst_key": _name_key(in_name),
+                        "walk": "rev",
+                    })
     return adj
 
 
-def search_routes(paths, start_name, end_name, directed=True,
+def search_routes(paths, start_name, end_name,
                   max_steps=ROUTE_MAX_STEPS, max_routes=ROUTE_MAX_ROUTES):
-    """All simple routes (no node used twice) from start to end.
+    """All simple routes (no node used twice) from start to end, walking each
+    line only in a direction its arrowheads allow.
 
-    Returns (routes, limit_hit). Each route is a list of edge dicts in
-    traversal order. A route is at most max_steps lines long, and at most
+    Returns (routes, limit_hit). Each route is a list of recipe-step dicts in
+    traversal order. A route is at most max_steps recipes long, and at most
     max_routes routes are collected (limit_hit=True when that cap was reached).
     """
     start_key = _name_key(start_name)
@@ -209,7 +231,7 @@ def search_routes(paths, start_name, end_name, directed=True,
     routes = []
     if start_key == end_key:
         return routes, False
-    adj = build_route_adjacency(paths, directed=directed)
+    adj = build_route_adjacency(paths)
     limit_hit = False
     visited = {start_key}
     stack = []
@@ -241,43 +263,63 @@ def search_routes(paths, start_name, end_name, directed=True,
 
 def find_routes(paths, start_name, end_name,
                 max_steps=ROUTE_MAX_STEPS, max_routes=ROUTE_MAX_ROUTES):
-    """Routes between two items, using the fallback order:
+    """Routes between two items in BOTH directions (arrowheads only — there is
+    no direction-ignoring fallback anymore).
 
-    1. first -> second following line direction (input -> output)
-    2. if none: second -> first following line direction
-    3. if still none: ignore line direction (direction_ignored=True if routes found)
-    4. if still none: no routes at all
-
-    Returns (routes, direction_ignored, limit_hit).
+    Returns (directions, limit_hit) where directions is a list of
+    (from_name, to_name, routes) — first start -> end, then end -> start.
+    limit_hit is True when either direction reached the route cap.
     """
-    routes, limit_hit = search_routes(
-        paths, start_name, end_name, directed=True,
-        max_steps=max_steps, max_routes=max_routes,
-    )
-    direction_ignored = False
-    if not routes:
-        routes, l2 = search_routes(
-            paths, end_name, start_name, directed=True,
-            max_steps=max_steps, max_routes=max_routes,
+    directions = []
+    limit_hit = False
+    for a, b in ((start_name, end_name), (end_name, start_name)):
+        routes, hit = search_routes(
+            paths, a, b, max_steps=max_steps, max_routes=max_routes
         )
-        limit_hit = limit_hit or l2
-    if not routes:
-        routes, l2 = search_routes(
-            paths, start_name, end_name, directed=False,
-            max_steps=max_steps, max_routes=max_routes,
-        )
-        limit_hit = limit_hit or l2
-        direction_ignored = bool(routes)
-    return routes, direction_ignored, limit_hit
+        directions.append((str(a), str(b), routes))
+        limit_hit = limit_hit or hit
+    return directions, limit_hit
 
 
-def format_route(route):
-    """One route as a single line, e.g. 'Cobblestone -(Crushing)-> Gravel -(Washing)-> Sand'."""
+def step_also_inputs(step):
+    """Inputs of a route step's recipe besides the one being walked
+    (the recipe's "also needs" items)."""
+    walked = _name_key(step["in_name"])
+    return [n for n in step["path"].get("inputs", []) if _name_key(n) != walked]
+
+
+def format_route_step(step, node_by_key=None):
+    """One route step, e.g. '-(Washing, 25%)-> 1 Flint', or with extra required
+    inputs: '-(Mixing, also needs 1 Flint, 50 mB Lava)-> 1 Veridium'."""
+    path = step["path"]
+    bits = [str(step["method"])]
+    chance = output_chance(path, step["out_name"])
+    if chance != 100.0:
+        bits.append(f"{format_chance(chance)}%")
+    also = step_also_inputs(step)
+    if also:
+        bits.append(
+            "also needs "
+            + ", ".join(
+                format_amount(input_amount(path, n), n, node_by_key) for n in also
+            )
+        )
+    if step.get("walk") == "rev":
+        # Walking output -> input: the destination is the recipe's input
+        dst_amount = input_amount(path, step["in_name"])
+    else:
+        dst_amount = output_amount(path, step["out_name"])
+    return f"-({', '.join(bits)})-> {format_amount(dst_amount, step['dst'], node_by_key)}"
+
+
+def format_route(route, node_by_key=None):
+    """One route as a single line, e.g.
+    'Cobblestone -(Crushing)-> 1 Gravel -(Washing, 25%)-> 1 Flint'."""
     if not route:
         return ""
     parts = [str(route[0]["src"])]
-    for edge in route:
-        parts.append(f"-({edge['method']})-> {edge['dst']}")
+    for step in route:
+        parts.append(format_route_step(step, node_by_key))
     return " ".join(parts)
 
 
@@ -357,6 +399,101 @@ def parse_outputs_with_chances(text):
     return entries
 
 
+# --- Per-item amounts (whole number >= 1, default 1; typed before the name) ---
+
+AMOUNT_MAX = 10 ** 9
+
+
+class AmountError(ValueError):
+    """Raised when an amount prefix is not a whole number >= 1."""
+
+
+AMOUNT_TOKEN_RE = re.compile(r"^(\d+)[xX]?$")
+AMOUNT_LIKE_RE = re.compile(r"^[-+]?\d")
+
+
+def parse_amount_prefix(tokens):
+    """Split an optional leading amount ('3' or '3x') off the token list.
+
+    Returns (amount_or_None, remaining_tokens). Raises AmountError when the
+    first token looks like a number but is not a valid whole number >= 1.
+    """
+    if not tokens:
+        return None, tokens
+    first = tokens[0]
+    m = AMOUNT_TOKEN_RE.fullmatch(first)
+    if m:
+        amount = int(m.group(1))
+        if amount < 1:
+            raise AmountError(f'amount "{first}" must be a whole number of at least 1')
+        if amount > AMOUNT_MAX:
+            raise AmountError(f'amount "{first}" is too large')
+        return amount, tokens[1:]
+    if AMOUNT_LIKE_RE.match(first):
+        raise AmountError(
+            f'invalid amount "{first}" — use a whole number of at least 1 before the '
+            f'name, e.g. "3 Clay" or "3x Clay"'
+        )
+    return None, tokens
+
+
+def parse_path_item(text, allow_chance):
+    """Parse one box entry: '[amount] Name [chance%]'.
+
+    Returns (name, amount, chance) with amount >= 1 (default 1) and chance a
+    float 0..100 or None. Raises AmountError / ValueError on bad input.
+    """
+    part = text.strip()
+    if not part:
+        return None
+    tokens = part.split()
+    amount, tokens = parse_amount_prefix(tokens)
+    rest = " ".join(tokens)
+    if allow_chance:
+        name, chance = parse_output_entry(rest)
+        if name is None:
+            raise AmountError("missing item name after the amount")
+    else:
+        name, chance = rest, None
+        if not name:
+            raise AmountError("missing item name after the amount")
+    return name, (1 if amount is None else amount), chance
+
+
+def parse_inputs_with_amounts(text):
+    """Parse the Inputs box into [(name, amount)], deduped case-insensitively."""
+    entries = []
+    seen = set()
+    for part in text.split(","):
+        parsed = parse_path_item(part, allow_chance=False)
+        if parsed is None:
+            continue
+        name, amount, _chance = parsed
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append((name, amount))
+    return entries
+
+
+def parse_outputs_with_amounts_chances(text):
+    """Parse the Outputs box into [(name, amount, chance_or_None)], deduped."""
+    entries = []
+    seen = set()
+    for part in text.split(","):
+        parsed = parse_path_item(part, allow_chance=True)
+        if parsed is None:
+            continue
+        name, amount, chance = parsed
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append((name, amount, chance))
+    return entries
+
+
 def normalize_chances(raw):
     """Keep only valid {output_key: chance 0..100} entries (keys lowercased)."""
     if not isinstance(raw, dict):
@@ -386,20 +523,129 @@ def format_chance(value):
     return f"{float(value):g}"
 
 
+def format_input_entry(path, in_name):
+    """One input as typed in the Inputs box, e.g. '3 Clay' (amount always shown)."""
+    return f"{input_amount(path, in_name)} {in_name}"
+
+
 def format_output_entry(path, out_name):
-    """One output as typed in the Outputs box, e.g. 'Flint 25%' (chance shown only if set)."""
+    """One output as typed in the Outputs box, e.g. '1 Flint 25%' (chance shown only if set)."""
+    base = f"{output_amount(path, out_name)} {out_name}"
     chances = path.get("chances")
     key = str(out_name).strip().lower()
     if isinstance(chances, dict) and key in chances:
-        return f"{out_name} {format_chance(chances[key])}%"
-    return str(out_name)
+        base += f" {format_chance(chances[key])}%"
+    return base
 
 
-def format_path(path):
+# --- Amount accessors (stored per path as {"inputs": {key: n}, "outputs": {key: n}}) ---
+
+
+def normalize_amounts(raw):
+    """Keep only valid amounts: {"inputs"/"outputs": {lower name: whole number 1..AMOUNT_MAX}}."""
+    if not isinstance(raw, dict):
+        return {}
+    cleaned = {}
+    for side in ("inputs", "outputs"):
+        sub = raw.get(side)
+        if not isinstance(sub, dict):
+            continue
+        clean_sub = {}
+        for k, v in sub.items():
+            key = str(k).strip().lower()
+            if not key or isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            if isinstance(v, float) and not v.is_integer():
+                continue
+            iv = int(v)
+            if 1 <= iv <= AMOUNT_MAX:
+                clean_sub[key] = iv
+        if clean_sub:
+            cleaned[side] = clean_sub
+    return cleaned
+
+
+def _amount_lookup(path, side, name):
+    amounts = path.get("amounts")
+    if isinstance(amounts, dict):
+        sub = amounts.get(side)
+        if isinstance(sub, dict):
+            v = sub.get(str(name).strip().lower())
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                iv = int(v)
+                if 1 <= iv <= AMOUNT_MAX:
+                    return iv
+    return 1
+
+
+def input_amount(path, in_name):
+    """Amount of one input item in a path; defaults to 1."""
+    return _amount_lookup(path, "inputs", in_name)
+
+
+def output_amount(path, out_name):
+    """Amount of one output item in a path; defaults to 1."""
+    return _amount_lookup(path, "outputs", out_name)
+
+
+def prune_path_amounts(path):
+    """Drop amounts for items no longer in the path (node deletion / path edit)."""
+    amounts = path.get("amounts")
+    if not isinstance(amounts, dict):
+        return
+    valid = {
+        "inputs": {str(i).strip().lower() for i in path.get("inputs", [])},
+        "outputs": {str(o).strip().lower() for o in path.get("outputs", [])},
+    }
+    cleaned = {}
+    for side, keys in valid.items():
+        sub = amounts.get(side)
+        if isinstance(sub, dict):
+            c = {k: v for k, v in sub.items() if k in keys}
+            if c:
+                cleaned[side] = c
+    if cleaned:
+        path["amounts"] = cleaned
+    else:
+        path.pop("amounts", None)
+
+
+# --- Item types: every item is an "item" or a "liquid" (default item) ---
+
+
+def normalize_node_type(value):
+    return "liquid" if str(value).strip().lower() == "liquid" else "item"
+
+
+def node_type(node):
+    """The item's type: 'item' (default) or 'liquid'."""
+    return normalize_node_type(node.get("type"))
+
+
+def is_liquid(node):
+    return node_type(node) == "liquid"
+
+
+def format_amount(amount, name, node_by_key=None):
+    """'3 Clay' for normal items, '50 mB Lava' for liquids (when types are known)."""
+    if node_by_key is not None:
+        node = node_by_key.get(str(name).strip().lower())
+        if node is not None and is_liquid(node):
+            return f"{int(amount)} mB {name}"
+    return f"{int(amount)} {name}"
+
+
+def format_path(path, node_by_key=None):
+    """Side-panel path text with amounts, e.g.
+    'Mixing: 3 Clay + 1 Flint + 50 mB Lava -> 1 Veridium (100%), 1 Flint (25%)'."""
     method = path["method"]
-    inputs_str = ", ".join(path["inputs"])
+    inputs_str = " + ".join(
+        format_amount(input_amount(path, n), n, node_by_key) for n in path["inputs"]
+    )
     outputs_str = ", ".join(
-        f"{name} ({format_chance(output_chance(path, name))}%)" for name in path["outputs"]
+        f"{format_amount(output_amount(path, n), n, node_by_key)} "
+        f"({format_chance(output_chance(path, n))}%)"
+        for n in path["outputs"]
     )
     return f"{method}: {inputs_str} \u2192 {outputs_str}"
 
@@ -515,6 +761,57 @@ def prune_path_chances(path):
         path.pop("chances", None)
 
 
+def rename_item_everywhere(nodes, paths, old_name, new_name):
+    """Rename an item in place: its node plus every reference in the paths —
+    the inputs/outputs lists, the per-pair arrowhead keys and the per-output
+    chance keys all follow the new name (matching is case-insensitive)."""
+    old_key = _name_key(old_name)
+    new_chance_key = new_name.strip().lower()
+    for node in nodes:
+        if _name_key(node.get("name", "")) == old_key:
+            node["name"] = new_name
+    for path in paths:
+        path["inputs"] = [
+            new_name if _name_key(n) == old_key else n for n in path.get("inputs", [])
+        ]
+        path["outputs"] = [
+            new_name if _name_key(n) == old_key else n for n in path.get("outputs", [])
+        ]
+        arrows = path.get("arrows")
+        if isinstance(arrows, dict) and arrows:
+            remapped = {}
+            for key, cfg in arrows.items():
+                try:
+                    pair = json.loads(key)
+                    in_name, out_name = str(pair[0]), str(pair[1])
+                except (ValueError, TypeError, IndexError):
+                    remapped[key] = cfg
+                    continue
+                if _name_key(in_name) == old_key:
+                    in_name = new_name
+                if _name_key(out_name) == old_key:
+                    out_name = new_name
+                remapped[arrow_pair_key(in_name, out_name)] = cfg
+            path["arrows"] = remapped
+        chances = path.get("chances")
+        if isinstance(chances, dict) and chances:
+            path["chances"] = {
+                (new_chance_key if _name_key(k) == old_key else k): v
+                for k, v in chances.items()
+            }
+        amounts = path.get("amounts")
+        if isinstance(amounts, dict) and amounts:
+            remapped_amounts = {}
+            for side in ("inputs", "outputs"):
+                sub = amounts.get(side)
+                if isinstance(sub, dict) and sub:
+                    remapped_amounts[side] = {
+                        (new_chance_key if _name_key(k) == old_key else k): v
+                        for k, v in sub.items()
+                    }
+            path["amounts"] = remapped_amounts
+
+
 def load_data():
     if not DATA_FILE.exists():
         return [], [], {}
@@ -554,6 +851,9 @@ def load_data():
                 color = _normalize_hex_color(entry.get("color"))
                 if color:
                     node_entry["color"] = color
+                # Item type: only "liquid" is stored, everything else is the default "item"
+                if normalize_node_type(entry.get("type")) == "liquid":
+                    node_entry["type"] = "liquid"
                 nodes.append(node_entry)
 
         method_colors = {}
@@ -592,6 +892,11 @@ def load_data():
                 chances = normalize_chances(entry.get("chances"))
                 if chances:
                     path_entry["chances"] = chances
+                # Per-item amounts; paths saved before this feature have no key
+                # and read as amount 1 for every input and output
+                amounts = normalize_amounts(entry.get("amounts"))
+                if amounts:
+                    path_entry["amounts"] = amounts
                 paths.append(path_entry)
 
         return nodes, paths, method_colors
@@ -605,6 +910,9 @@ def _node_save_entry(node):
     color = _normalize_hex_color(node.get("color"))
     if color:
         entry["color"] = color
+    # Only non-default types are stored ("liquid"); "item" is the default
+    if normalize_node_type(node.get("type")) == "liquid":
+        entry["type"] = "liquid"
     return entry
 
 
@@ -618,6 +926,7 @@ def save_data(nodes, paths, method_colors):
                 "outputs": list(path["outputs"]),
                 **({"arrows": normalize_arrows(path["arrows"])} if path.get("arrows") else {}),
                 **({"chances": normalize_chances(path["chances"])} if path.get("chances") else {}),
+                **({"amounts": normalize_amounts(path["amounts"])} if path.get("amounts") else {}),
             }
             for path in paths
         ],
@@ -831,6 +1140,10 @@ def draw_node(canvas, node, tag, selected=False, zoom=1.0, pan_x=0.0, pan_y=0.0,
     elif selected:
         outline_w = max(1.0, 2.5 * zoom)
         outline_color = NODE_SELECTED_OUTLINE
+    elif is_liquid(node):
+        # Liquids get a blue outline; the fill colour stays exactly as it is
+        outline_w = max(1.0, 2.0 * zoom)
+        outline_color = LIQUID_OUTLINE_COLOR
     else:
         outline_w = max(1.0, 2.0 * zoom)
         outline_color = NODE_OUTLINE
@@ -896,6 +1209,7 @@ def draw_connections(
     view_rect=None,
     edge_sink=None,
     route_edge_keys=None,
+    route_also_keys=None,
     routes_active=False,
 ):
     canvas.delete("connection")
@@ -936,6 +1250,13 @@ def draw_connections(
                     and route_edge_keys is not None
                     and _route_edge_key(path, in_name, out_name) in route_edge_keys
                 )
+                # Extra input line required by a route recipe (its "also needs"):
+                # drawn dashed bright, but not walked as part of the route
+                also_needed = bool(
+                    routes_active
+                    and route_also_keys is not None
+                    and _route_edge_key(path, in_name, out_name) in route_also_keys
+                )
                 edge = {
                     "src": src,
                     "dst": dst,
@@ -948,8 +1269,13 @@ def draw_connections(
                     "in_name": in_name,
                     "out_name": out_name,
                     "on_route": on_route,
-                    # Draw route lines last so they sit on top of dimmed lines
-                    "rank": (2 if on_route else 0) if routes_active else (1 if connected_to_selected else 0),
+                    "also_needed": also_needed,
+                    # Draw route lines last so they sit on top of dashed/dimmed lines
+                    "rank": (
+                        (2 if on_route else (1 if also_needed else 0))
+                        if routes_active
+                        else (1 if connected_to_selected else 0)
+                    ),
                 }
                 raw_edges.append(edge)
                 pair_key = tuple(sorted((src_key, dst_key)))
@@ -1006,23 +1332,35 @@ def draw_connections(
                 line_color = edge["color"]
                 base_lw = ROUTE_LINE_WIDTH
                 base_arrow = (14, 17, 7)
+                dash = ()
+            elif edge["also_needed"]:
+                # Required by a route recipe but not part of the route itself:
+                # dashed bright line (dash in screen pixels, scaled by zoom)
+                line_color = ROUTE_HIGHLIGHT_COLOR
+                base_lw = ROUTE_LINE_WIDTH
+                base_arrow = (14, 17, 7)
+                dash = (max(2, int(round(7 * zoom))), max(2, int(round(5 * zoom))))
             else:
                 # Everything not on a route dims toward the background
                 line_color = blend_colors(edge["color"], BG_COLOR, DIM_BLEND_FACTOR)
                 base_lw = LINE_WIDTH_DIMMED
                 base_arrow = (9, 11, 4)
+                dash = ()
         elif selected_key is None:
             line_color = edge["color"]
             base_lw = LINE_WIDTH_NORMAL
             base_arrow = (11, 13, 5)
+            dash = ()
         elif edge["connected"]:
             line_color = edge["color"]
             base_lw = LINE_WIDTH_SELECTED
             base_arrow = (13, 16, 6)
+            dash = ()
         else:
             line_color = blend_colors(edge["color"], BG_COLOR, DIM_BLEND_FACTOR)
             base_lw = LINE_WIDTH_DIMMED
             base_arrow = (9, 11, 4)
+            dash = ()
 
         line_width = max(1.0, base_lw * zoom)
         arrow_shape = (
@@ -1068,6 +1406,7 @@ def draw_connections(
                 width=line_width,
                 arrow=arrow_mode,
                 arrowshape=arrow_shape,
+                dash=dash,
                 tags=("connection",),
             )
             continue
@@ -1117,6 +1456,7 @@ def draw_connections(
                 arrow=arrow_mode,
                 arrowshape=arrow_shape,
                 capstyle=tk.ROUND,
+                dash=dash,
                 tags=("connection",),
             )
         else:
@@ -1162,6 +1502,7 @@ def draw_connections(
                 arrow=arrow_mode,
                 arrowshape=arrow_shape,
                 capstyle=tk.ROUND,
+                dash=dash,
                 tags=("connection",),
             )
 
@@ -1184,6 +1525,10 @@ def update_node_selection_visuals(canvas, nodes, selected_node, zoom=1.0,
         elif is_selected:
             outline_w = max(1.0, 2.5 * zoom)
             outline_color = NODE_SELECTED_OUTLINE
+        elif is_liquid(node):
+            # Liquids keep their blue outline even when not selected
+            outline_w = max(1.0, 2.0 * zoom)
+            outline_color = LIQUID_OUTLINE_COLOR
         else:
             outline_w = max(1.0, 2.0 * zoom)
             outline_color = NODE_OUTLINE
@@ -1221,6 +1566,7 @@ def redraw_all(
     route_node_keys=None,
     route_point_keys=None,
     route_edge_keys=None,
+    route_also_keys=None,
     routes_active=False,
 ):
     """Redraw the scene, creating canvas items only for what is on screen.
@@ -1281,6 +1627,7 @@ def redraw_all(
             view_rect=view_rect,
             edge_sink=edge_sink,
             route_edge_keys=route_edge_keys,
+            route_also_keys=route_also_keys,
             routes_active=routes_active,
         )
 
@@ -1323,11 +1670,12 @@ class CreateItemTrackerApp:
         # Route finding (Shift+click two nodes): endpoints, found routes, highlight sets
         self.route_start = None
         self.route_end = None
-        self.routes = []
-        self.route_direction_ignored = False
+        self.route_directions = []  # [(from_name, to_name, routes)] for both directions
+        self.routes = []  # every found route of both directions (for highlighting)
         self.route_limit_hit = False
         self._route_node_keys = set()
         self._route_edge_keys = set()
+        self._route_also_edge_keys = set()  # extra required input lines, drawn dashed bright
         self._route_point_keys = set()
         self._status_after_id = None
 
@@ -1438,6 +1786,8 @@ class CreateItemTrackerApp:
             activebackground=BTN_BG,
             activeforeground=BTN_FG,
         )
+        self.context_menu.add_command(label="Rename...", command=self.rename_context_node)
+        self.context_menu.add_separator()
         self.context_menu.add_command(label="Delete", command=self.delete_context_node)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Change colour", command=self.change_context_node_color)
@@ -1480,6 +1830,13 @@ class CreateItemTrackerApp:
         # Dismiss search dropdown when clicking outside search widgets
         self.root.bind("<ButtonPress-1>", self._on_global_click, add="+")
         self.root.bind("<Configure>", lambda _e: self._reposition_search_dropdown(), add="+")
+
+        # Mouse-wheel scrolling for the right panel: when the pointer is over
+        # the side panel, the wheel scrolls the paths list (path cards plus the
+        # "Made from"/"Used in" sections below them) instead of zooming the canvas
+        self.root.bind_all("<MouseWheel>", self._on_panel_mousewheel, add="+")
+        self.root.bind_all("<Button-4>", self._on_panel_wheel_up, add="+")
+        self.root.bind_all("<Button-5>", self._on_panel_wheel_down, add="+")
 
     def _build_search_dropdown(self):
         self.search_dropdown = tk.Frame(
@@ -1571,14 +1928,60 @@ class CreateItemTrackerApp:
         )
         close_btn.pack(side=tk.RIGHT)
 
+        rename_btn = tk.Button(
+            header,
+            text="Rename",
+            command=self.rename_selected_node,
+            bg=SECONDARY_BTN_BG,
+            fg=INPUT_FG,
+            activebackground=SECONDARY_BTN_ACTIVE_BG,
+            activeforeground=BTN_FG,
+            relief=tk.FLAT,
+            bd=0,
+            padx=8,
+            pady=2,
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2",
+        )
+        rename_btn.pack(side=tk.RIGHT, padx=(0, 8))
+
         divider = tk.Frame(self.side_panel, bg=PANEL_BORDER, height=1)
         divider.pack(side=tk.TOP, fill=tk.X)
 
-        actions_bar = tk.Frame(self.side_panel, bg=PANEL_BG, padx=14, pady=10)
-        actions_bar.pack(side=tk.TOP, fill=tk.X)
+        # Item type dropdown (shown under the item's name while an item is selected)
+        self.type_row = tk.Frame(self.side_panel, bg=PANEL_BG, padx=14, pady=6)
+        tk.Label(
+            self.type_row,
+            text="Type:",
+            bg=PANEL_BG,
+            fg=MUTED_FG,
+            font=("Segoe UI", 10, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        self.type_var = tk.StringVar(value="Item")
+        self.type_menu = tk.OptionMenu(
+            self.type_row, self.type_var, "Item", "Liquid", command=self.on_item_type_change
+        )
+        self.type_menu.configure(
+            bg=INPUT_BG,
+            fg=INPUT_FG,
+            activebackground=SECONDARY_BTN_ACTIVE_BG,
+            activeforeground=BTN_FG,
+            highlightthickness=0,
+            relief=tk.FLAT,
+            bd=0,
+            font=("Segoe UI", 10),
+            cursor="hand2",
+        )
+        self.type_menu["menu"].configure(
+            bg=CARD_BG, fg=NODE_TEXT, activebackground=BTN_BG, activeforeground=BTN_FG
+        )
+        self.type_menu.pack(side=tk.LEFT)
+
+        self.actions_bar = tk.Frame(self.side_panel, bg=PANEL_BG, padx=14, pady=10)
+        self.actions_bar.pack(side=tk.TOP, fill=tk.X)
 
         paths_heading = tk.Label(
-            actions_bar,
+            self.actions_bar,
             text="Paths",
             bg=PANEL_BG,
             fg=MUTED_FG,
@@ -1587,7 +1990,7 @@ class CreateItemTrackerApp:
         paths_heading.pack(side=tk.LEFT)
 
         self.add_path_btn = tk.Button(
-            actions_bar,
+            self.actions_bar,
             text="Add path",
             command=self.open_add_path_form,
             bg=BTN_BG,
@@ -1647,7 +2050,21 @@ class CreateItemTrackerApp:
             relief=tk.FLAT,
             font=("Segoe UI", 10),
         )
-        self.inputs_entry.pack(side=tk.TOP, fill=tk.X, ipady=4, pady=(2, 8))
+        self.inputs_entry.pack(side=tk.TOP, fill=tk.X, ipady=4, pady=(2, 2))
+        self.inputs_hint_text = (
+            'Amount before the name, e.g. "3 Clay, 1 Flint, 50 Lava" '
+            '("3x Clay" also works; no number = 1)'
+        )
+        self.inputs_hint = tk.Label(
+            self.form_frame,
+            text=self.inputs_hint_text,
+            bg=CARD_BG,
+            fg=MUTED_FG,
+            font=("Segoe UI", 8),
+            anchor="w",
+            justify=tk.LEFT,
+        )
+        self.inputs_hint.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
 
         tk.Label(
             self.form_frame,
@@ -1666,15 +2083,20 @@ class CreateItemTrackerApp:
             font=("Segoe UI", 10),
         )
         self.outputs_entry.pack(side=tk.TOP, fill=tk.X, ipady=4, pady=(2, 2))
-        tk.Label(
+        self.outputs_hint_text = (
+            'Amount before the name, chance after it, e.g. "1 Veridium, 2 Gravel, 1 Flint 25%" '
+            "(amount default 1, chance default 100%)"
+        )
+        self.outputs_hint = tk.Label(
             self.form_frame,
-            text='Optional chance per output, e.g. "Gravel, Flint 25%, Clay 10%" (default 100%)',
+            text=self.outputs_hint_text,
             bg=CARD_BG,
             fg=MUTED_FG,
             font=("Segoe UI", 8),
             anchor="w",
             justify=tk.LEFT,
-        ).pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
+        )
+        self.outputs_hint.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
         self.method_entry.bind("<Return>", lambda _event: self.inputs_entry.focus_set())
         self.inputs_entry.bind("<Return>", lambda _event: self.outputs_entry.focus_set())
         self.outputs_entry.bind("<Return>", lambda _event: self.submit_add_path_form())
@@ -1746,6 +2168,81 @@ class CreateItemTrackerApp:
         self.paths_list_frame.bind("<Configure>", self._on_paths_frame_configure)
         self.paths_canvas.bind("<Configure>", self._on_paths_canvas_configure)
 
+        # "Made from" / "Used in" sections live INSIDE the scrollable paths list,
+        # directly below the path cards, so they scroll along with the paths and
+        # stay reachable no matter how many paths there are.
+        # (constructor pady must be a single distance; the per-section bottom
+        # padding is applied at pack time in _fill_section)
+        self.made_from_frame = tk.Frame(self.paths_list_frame, bg=PANEL_BG, padx=4, pady=0)
+        self.used_in_frame = tk.Frame(self.paths_list_frame, bg=PANEL_BG, padx=4, pady=0)
+
+    def _clear_section(self, frame):
+        for child in frame.winfo_children():
+            child.destroy()
+        if frame.winfo_ismapped():
+            frame.pack_forget()
+
+    def _clear_path_list_children(self):
+        """Destroy the path/route cards but keep the two section frames as
+        children of the list (they are re-packed below the cards afterwards,
+        so the whole list scrolls as one unit)."""
+        for child in self.paths_list_frame.winfo_children():
+            if child is self.made_from_frame or child is self.used_in_frame:
+                continue
+            child.destroy()
+        self._clear_section(self.made_from_frame)
+        self._clear_section(self.used_in_frame)
+
+    def _fill_section(self, frame, heading, lines, pad_bottom=4):
+        """Render one side-panel section (heading + one line per entry)."""
+        self._clear_section(frame)
+        if not lines:
+            return
+        frame.pack(side=tk.TOP, fill=tk.X, pady=(0, pad_bottom))
+        tk.Label(
+            frame,
+            text=heading,
+            bg=PANEL_BG,
+            fg=MUTED_FG,
+            font=("Segoe UI", 10, "bold"),
+            anchor="w",
+        ).pack(side=tk.TOP, fill=tk.X)
+        for line in lines:
+            tk.Label(
+                frame,
+                text=line,
+                bg=PANEL_BG,
+                fg=NODE_TEXT,
+                font=("Segoe UI", 9),
+                anchor="w",
+                justify=tk.LEFT,
+                wraplength=PANEL_WIDTH - 60,
+            ).pack(side=tk.TOP, fill=tk.X, pady=(2, 0))
+
+    def _render_item_sections(self, item_name):
+        """'Made from' (paths producing the item) and 'Used in' (paths consuming it)."""
+        node_by_key = {n["name"].strip().lower(): n for n in self.nodes}
+        target = item_name.strip().lower()
+        made_from = []
+        used_in = []
+        for p in self.paths:
+            inputs = p.get("inputs", [])
+            outputs = p.get("outputs", [])
+            in_inputs = any(str(n).strip().lower() == target for n in inputs)
+            in_outputs = any(str(n).strip().lower() == target for n in outputs)
+            inputs_str = ", ".join(
+                format_amount(input_amount(p, n), n, node_by_key) for n in inputs
+            )
+            outputs_str = ", ".join(
+                format_amount(output_amount(p, n), n, node_by_key) for n in outputs
+            )
+            if in_outputs:
+                made_from.append(f"{p['method']}: needs {inputs_str}")
+            if in_inputs:
+                used_in.append(f"{p['method']}: uses {inputs_str}, makes {outputs_str}")
+        self._fill_section(self.made_from_frame, "Made from", made_from, pad_bottom=4)
+        self._fill_section(self.used_in_frame, "Used in", used_in, pad_bottom=12)
+
     def _on_paths_frame_configure(self, _event=None):
         bbox = self.paths_canvas.bbox("all")
         self.paths_canvas.configure(scrollregion=bbox if bbox else (0, 0, 0, 0))
@@ -1789,6 +2286,7 @@ class CreateItemTrackerApp:
             "route_node_keys": self._route_node_keys,
             "route_point_keys": self._route_point_keys,
             "route_edge_keys": self._route_edge_keys,
+            "route_also_keys": self._route_also_edge_keys,
             "routes_active": bool(self.routes),
         }
 
@@ -1827,6 +2325,7 @@ class CreateItemTrackerApp:
             view_rect=self._current_view_rect(),
             edge_sink=self._drawn_edges,
             route_edge_keys=self._route_edge_keys,
+            route_also_keys=self._route_also_edge_keys,
             routes_active=bool(self.routes),
         )
         self._update_hover()
@@ -1876,9 +2375,10 @@ class CreateItemTrackerApp:
             # Shift+click on a third node: start a new selection with it as the first point
             self.route_start = node
             self.route_end = None
+            self.route_directions = []
             self.routes = []
-            self.route_direction_ignored = False
             self.route_limit_hit = False
+            self._route_also_edge_keys = set()
             self.show_status(
                 f"Route start: {node['name']} — Shift+click a second node",
                 auto_hide_ms=4000,
@@ -1899,38 +2399,45 @@ class CreateItemTrackerApp:
     def _compute_routes(self):
         a = self.route_start["name"]
         b = self.route_end["name"]
-        self.routes, self.route_direction_ignored, self.route_limit_hit = find_routes(
-            self.paths, a, b
-        )
-        if self.routes:
-            if self.route_direction_ignored:
-                msg = (
-                    f"No directed route {a} \u2192 {b}; ignoring line direction — "
-                    f"{len(self.routes)} route(s) found"
-                )
-            elif _name_key(self.routes[0][0]["src"]) == _name_key(a):
-                msg = f"Found {len(self.routes)} route(s) from {a} to {b}"
-            else:
-                msg = f"No route {a} \u2192 {b}; found {len(self.routes)} route(s) from {b} to {a}"
+        # Both directions are searched, each following arrowheads only
+        self.route_directions, self.route_limit_hit = find_routes(self.paths, a, b)
+        self.routes = [
+            route for (_fa, _fb, routes) in self.route_directions for route in routes
+        ]
+        found = [
+            f"{len(routes)} route(s) {fa} \u2192 {fb}"
+            for fa, fb, routes in self.route_directions
+            if routes
+        ]
+        if found:
+            msg = "Found " + " and ".join(found)
             if self.route_limit_hit:
                 msg += (
-                    f" (limit hit: max {ROUTE_MAX_ROUTES} routes, "
+                    f" (limit hit: max {ROUTE_MAX_ROUTES} routes per direction, "
                     f"{ROUTE_MAX_STEPS} steps each)"
                 )
             self.show_status(msg)
         else:
-            self.show_status("No route found", auto_hide_ms=8000)
+            self.show_status(
+                f"No route found between {a} and {b}", auto_hide_ms=8000
+            )
 
     def _after_route_change(self):
         self._route_node_keys = set()
         self._route_edge_keys = set()
+        self._route_also_edge_keys = set()
         for route in self.routes:
             self._route_node_keys.add(_name_key(route[0]["src"]))
-            for edge in route:
-                self._route_node_keys.add(_name_key(edge["dst"]))
+            for step in route:
+                self._route_node_keys.add(_name_key(step["dst"]))
                 self._route_edge_keys.add(
-                    _route_edge_key(edge["path"], edge["in_name"], edge["out_name"])
+                    _route_edge_key(step["path"], step["in_name"], step["out_name"])
                 )
+                # Extra required inputs of this recipe become dashed bright lines
+                for also in step_also_inputs(step):
+                    self._route_also_edge_keys.add(
+                        _route_edge_key(step["path"], also, step["out_name"])
+                    )
         self._route_point_keys = set()
         if self.route_start is not None:
             self._route_point_keys.add(_name_key(self.route_start["name"]))
@@ -1947,11 +2454,12 @@ class CreateItemTrackerApp:
         had_routes = self.route_start is not None or bool(self.routes)
         self.route_start = None
         self.route_end = None
+        self.route_directions = []
         self.routes = []
-        self.route_direction_ignored = False
         self.route_limit_hit = False
         self._route_node_keys = set()
         self._route_edge_keys = set()
+        self._route_also_edge_keys = set()
         self._route_point_keys = set()
         self.hide_status()
         if self.side_panel.winfo_ismapped():
@@ -1969,12 +2477,12 @@ class CreateItemTrackerApp:
             self._after_route_change()
 
     def _render_route_panel(self):
-        for child in self.paths_list_frame.winfo_children():
-            child.destroy()
+        self._clear_path_list_children()
         self.hide_add_path_form()
+        self._sync_type_row()
         if self.route_start is not None and self.route_end is not None:
             self.panel_title_label.configure(
-                text=f"Routes: {self.route_start['name']} \u2192 {self.route_end['name']}"
+                text=f"Routes between {self.route_start['name']} and {self.route_end['name']}"
             )
         elif self.route_start is not None:
             self.panel_title_label.configure(text=f"Route from {self.route_start['name']}")
@@ -1983,6 +2491,7 @@ class CreateItemTrackerApp:
         if self.route_start is None:
             self._sync_paths_scrollregion()
             return
+        node_by_key = {n["name"].strip().lower(): n for n in self.nodes}
         if self.route_end is None:
             hint = tk.Label(
                 self.paths_list_frame,
@@ -1995,52 +2504,62 @@ class CreateItemTrackerApp:
                 wraplength=PANEL_WIDTH - 60,
             )
             hint.pack(side=tk.TOP, fill=tk.X, pady=(6, 0))
-        elif not self.routes:
-            note = "No route found between the two points."
-            if self.route_direction_ignored:
-                note += " (Line direction was ignored, but still no route.)"
-            lbl = tk.Label(
-                self.paths_list_frame,
-                text=note,
-                bg=PANEL_BG,
-                fg=MUTED_FG,
-                font=("Segoe UI", 10),
-                anchor="w",
-                justify=tk.LEFT,
-                wraplength=PANEL_WIDTH - 60,
-            )
-            lbl.pack(side=tk.TOP, fill=tk.X, pady=(6, 0))
         else:
-            head = tk.Label(
-                self.paths_list_frame,
-                text=f"{len(self.routes)} route(s):",
-                bg=PANEL_BG,
-                fg=NODE_TEXT,
-                font=("Segoe UI", 10, "bold"),
-                anchor="w",
-            )
-            head.pack(side=tk.TOP, fill=tk.X, pady=(6, 4))
-            for route in self.routes:
-                card = tk.Frame(
+            # Each direction gets its own heading; a direction with no
+            # routes says so under its heading
+            for fa, fb, routes in self.route_directions:
+                head = tk.Label(
                     self.paths_list_frame,
-                    bg=CARD_BG,
-                    padx=10,
-                    pady=6,
-                    highlightbackground=PANEL_BORDER,
-                    highlightthickness=1,
-                )
-                card.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
-                lbl = tk.Label(
-                    card,
-                    text=format_route(route),
-                    bg=CARD_BG,
+                    text=f"{fa} \u2192 {fb}",
+                    bg=PANEL_BG,
                     fg=NODE_TEXT,
-                    font=("Segoe UI", 9),
+                    font=("Segoe UI", 10, "bold"),
                     anchor="w",
-                    justify=tk.LEFT,
-                    wraplength=PANEL_WIDTH - 90,
                 )
-                lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                head.pack(side=tk.TOP, fill=tk.X, pady=(6, 2))
+                if not routes:
+                    note = tk.Label(
+                        self.paths_list_frame,
+                        text="No route found in this direction.",
+                        bg=PANEL_BG,
+                        fg=MUTED_FG,
+                        font=("Segoe UI", 10),
+                        anchor="w",
+                        justify=tk.LEFT,
+                        wraplength=PANEL_WIDTH - 60,
+                    )
+                    note.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+                    continue
+                count = tk.Label(
+                    self.paths_list_frame,
+                    text=f"{len(routes)} route(s):",
+                    bg=PANEL_BG,
+                    fg=NODE_TEXT,
+                    font=("Segoe UI", 10),
+                    anchor="w",
+                )
+                count.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
+                for route in routes:
+                    card = tk.Frame(
+                        self.paths_list_frame,
+                        bg=CARD_BG,
+                        padx=10,
+                        pady=6,
+                        highlightbackground=PANEL_BORDER,
+                        highlightthickness=1,
+                    )
+                    card.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+                    lbl = tk.Label(
+                        card,
+                        text=format_route(route, node_by_key),
+                        bg=CARD_BG,
+                        fg=NODE_TEXT,
+                        font=("Segoe UI", 9),
+                        anchor="w",
+                        justify=tk.LEFT,
+                        wraplength=PANEL_WIDTH - 90,
+                    )
+                    lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.paths_canvas.yview_moveto(0)
         self._sync_paths_scrollregion()
 
@@ -2256,6 +2775,47 @@ class CreateItemTrackerApp:
             return
         self.hide_search_dropdown()
 
+    # --- Mouse-wheel scrolling of the right panel's paths list ---
+
+    def _widget_in_side_panel(self, widget):
+        w = widget
+        while w is not None:
+            if w is self.side_panel:
+                return True
+            try:
+                w = w.master
+            except tk.TclError:
+                return False
+        return False
+
+    def _scroll_paths_list(self, steps):
+        try:
+            self.paths_canvas.yview_scroll(steps, "units")
+        except tk.TclError:
+            pass
+
+    def _on_panel_mousewheel(self, event):
+        if not self._widget_in_side_panel(getattr(event, "widget", None)):
+            return None  # not over the side panel: leave canvas zoom etc. alone
+        delta = getattr(event, "delta", 0)
+        if not delta:
+            return "break"
+        mag = max(1, abs(delta) // 120) if abs(delta) >= 120 else 1
+        self._scroll_paths_list(-mag if delta > 0 else mag)
+        return "break"
+
+    def _on_panel_wheel_up(self, event):  # Linux X11 wheel up
+        if not self._widget_in_side_panel(getattr(event, "widget", None)):
+            return None
+        self._scroll_paths_list(-1)
+        return "break"
+
+    def _on_panel_wheel_down(self, event):  # Linux X11 wheel down
+        if not self._widget_in_side_panel(getattr(event, "widget", None)):
+            return None
+        self._scroll_paths_list(1)
+        return "break"
+
     # --- Persistence & state ---
 
     def _load_initial_state(self):
@@ -2275,6 +2835,8 @@ class CreateItemTrackerApp:
             color = _normalize_hex_color(entry.get("color"))
             if color:
                 node["color"] = color
+            if normalize_node_type(entry.get("type")) == "liquid":
+                node["type"] = "liquid"
             self.next_id += 1
             self.nodes.append(node)
 
@@ -2502,6 +3064,32 @@ class CreateItemTrackerApp:
             return existing
         return self._create_node(name, near_node=near_node)
 
+    def _sync_type_row(self):
+        """Show the Type dropdown under the selected item's name (hidden in route mode)."""
+        if self.route_start is not None or self.selected_node is None:
+            if self.type_row.winfo_ismapped():
+                self.type_row.pack_forget()
+            return
+        self.type_var.set("Liquid" if is_liquid(self.selected_node) else "Item")
+        if not self.type_row.winfo_ismapped():
+            self.type_row.pack(side=tk.TOP, fill=tk.X, before=self.actions_bar)
+
+    def on_item_type_change(self, _choice):
+        if self.selected_node is None or self.route_start is not None:
+            return
+        new_type = normalize_node_type(self.type_var.get())
+        if new_type == "liquid":
+            self.selected_node["type"] = "liquid"
+        else:
+            self.selected_node.pop("type", None)
+        self._save_state()
+        # Outline colour depends on the type, so redraw the node visuals
+        update_node_selection_visuals(
+            self.canvas, self.nodes, self.selected_node, zoom=self.zoom, **self._node_visual_kwargs()
+        )
+        self._redraw_lines()
+        self.refresh_side_panel_paths()
+
     def select_node(self, node):
         if node is None:
             self.close_side_panel()
@@ -2518,6 +3106,7 @@ class CreateItemTrackerApp:
             self.side_panel.pack(side=tk.RIGHT, fill=tk.Y, before=self.canvas)
 
         self.panel_title_label.configure(text=node["name"])
+        self._sync_type_row()
         if node_changed and self.form_visible:
             self.hide_add_path_form()
         self.refresh_side_panel_paths()
@@ -2529,6 +3118,7 @@ class CreateItemTrackerApp:
         )
         self._redraw_lines()
         self.hide_add_path_form()
+        self._sync_type_row()
         if self.side_panel.winfo_ismapped():
             self.side_panel.pack_forget()
 
@@ -2552,6 +3142,7 @@ class CreateItemTrackerApp:
         self.inputs_entry.delete(0, tk.END)
         self.inputs_entry.insert(0, self.selected_node["name"])
         self.outputs_entry.delete(0, tk.END)
+        self._reset_form_hints()
         self.method_entry.focus_set()
 
     def edit_path(self, path_obj):
@@ -2574,11 +3165,14 @@ class CreateItemTrackerApp:
         self.method_entry.delete(0, tk.END)
         self.method_entry.insert(0, path_obj["method"])
         self.inputs_entry.delete(0, tk.END)
-        self.inputs_entry.insert(0, ", ".join(path_obj["inputs"]))
+        self.inputs_entry.insert(
+            0, ", ".join(format_input_entry(path_obj, i) for i in path_obj["inputs"])
+        )
         self.outputs_entry.delete(0, tk.END)
         self.outputs_entry.insert(
             0, ", ".join(format_output_entry(path_obj, o) for o in path_obj["outputs"])
         )
+        self._reset_form_hints()
         self.method_entry.focus_set()
 
     def hide_add_path_form(self):
@@ -2587,15 +3181,36 @@ class CreateItemTrackerApp:
             self.form_frame.pack_forget()
             self.form_visible = False
 
+    def _reset_form_hints(self):
+        self.inputs_hint.configure(text=self.inputs_hint_text, fg=MUTED_FG)
+        self.outputs_hint.configure(text=self.outputs_hint_text, fg=MUTED_FG)
+
+    def _flag_hint(self, which, message):
+        # Show the problem inline under the offending box (plus the popup below)
+        hint = self.inputs_hint if which == "inputs" else self.outputs_hint
+        hint.configure(text=str(message), fg=DANGER_BTN_BG)
+
     def submit_add_path_form(self):
         raw_method = self.method_entry.get().strip()
-        raw_inputs = parse_comma_separated(self.inputs_entry.get())
+        self._reset_form_hints()
         try:
-            parsed_outputs = parse_outputs_with_chances(self.outputs_entry.get())
+            parsed_inputs = parse_inputs_with_amounts(self.inputs_entry.get())
+        except AmountError as exc:
+            self._flag_hint("inputs", exc)
+            messagebox.showwarning("Invalid amount", str(exc), parent=self.root)
+            return
+        try:
+            parsed_outputs = parse_outputs_with_amounts_chances(self.outputs_entry.get())
+        except AmountError as exc:
+            self._flag_hint("outputs", exc)
+            messagebox.showwarning("Invalid amount", str(exc), parent=self.root)
+            return
         except ValueError as exc:
+            self._flag_hint("outputs", exc)
             messagebox.showwarning("Invalid percentage", str(exc), parent=self.root)
             return
-        raw_outputs = [name for name, _chance in parsed_outputs]
+        raw_inputs = [name for name, _amount in parsed_inputs]
+        raw_outputs = [name for name, _amount, _chance in parsed_outputs]
 
         if not raw_method:
             messagebox.showwarning("Missing Method", "Please enter a method name.", parent=self.root)
@@ -2613,18 +3228,25 @@ class CreateItemTrackerApp:
 
         anchor_node = self.selected_node
         canonical_inputs = []
-        for item_name in raw_inputs:
+        input_amounts = {}
+        for item_name, amount in parsed_inputs:
             node = self._ensure_node(item_name, near_node=anchor_node)
             canonical_inputs.append(node["name"])
+            input_amounts[node["name"].strip().lower()] = int(amount)
 
         first_input_node = self._find_node_by_name(canonical_inputs[0]) or anchor_node
         canonical_outputs = []
         chances = {}
-        for item_name, chance in parsed_outputs:
+        output_amounts = {}
+        for item_name, amount, chance in parsed_outputs:
             node = self._ensure_node(item_name, near_node=first_input_node)
             canonical_outputs.append(node["name"])
+            output_amounts[node["name"].strip().lower()] = int(amount)
             if chance is not None:
                 chances[node["name"].strip().lower()] = float(chance)
+
+        amounts = {"inputs": input_amounts, "outputs": output_amounts}
+        amounts = normalize_amounts(amounts)
 
         editing = self.editing_path
         is_editing = editing is not None and any(p is editing for p in self.paths)
@@ -2641,6 +3263,11 @@ class CreateItemTrackerApp:
                 editing["chances"] = chances
             else:
                 editing.pop("chances", None)
+            # Amounts follow the items (kept for items still in the path)
+            if amounts:
+                editing["amounts"] = amounts
+            else:
+                editing.pop("amounts", None)
         else:
             new_path = {
                 "method": canonical_method,
@@ -2649,6 +3276,8 @@ class CreateItemTrackerApp:
             }
             if chances:
                 new_path["chances"] = chances
+            if amounts:
+                new_path["amounts"] = amounts
             self.paths.append(new_path)
         self.editing_path = None
 
@@ -2680,14 +3309,15 @@ class CreateItemTrackerApp:
             self._render_route_panel()
             return
 
-        for child in self.paths_list_frame.winfo_children():
-            child.destroy()
+        self._clear_path_list_children()
 
+        self._sync_type_row()
         if self.selected_node is None:
             self._sync_paths_scrollregion()
             return
 
         item_name = self.selected_node["name"]
+        node_by_key = {n["name"].strip().lower(): n for n in self.nodes}
         matching_paths = [p for p in self.paths if path_involves_item(p, item_name)]
 
         if not matching_paths:
@@ -2701,6 +3331,7 @@ class CreateItemTrackerApp:
                 justify=tk.LEFT,
             )
             empty_label.pack(side=tk.TOP, fill=tk.X, pady=(6, 0))
+            self._render_item_sections(item_name)
             self._sync_paths_scrollregion()
             return
 
@@ -2761,7 +3392,7 @@ class CreateItemTrackerApp:
 
             text_label = tk.Label(
                 card,
-                text=format_path(path_obj),
+                text=format_path(path_obj, node_by_key),
                 bg=CARD_BG,
                 fg=NODE_TEXT,
                 font=("Segoe UI", 10),
@@ -2776,6 +3407,7 @@ class CreateItemTrackerApp:
                 clickable.bind("<Button-1>", lambda _e, p=path_obj: self.edit_path(p))
                 clickable.configure(cursor="hand2")
 
+        self._render_item_sections(item_name)
         self.paths_canvas.yview_moveto(0)
         self._sync_paths_scrollregion()
 
@@ -2997,6 +3629,7 @@ class CreateItemTrackerApp:
                     p["outputs"] = [n for n in p["outputs"] if n.strip().lower() != item_key]
                     prune_path_arrows(p)
                     prune_path_chances(p)
+                    prune_path_amounts(p)
                     if not (p["inputs"] and p["outputs"]):
                         continue  # path would have no inputs/outputs left: delete it
                 new_paths.append(p)
@@ -3047,6 +3680,54 @@ class CreateItemTrackerApp:
                 self.canvas, self.nodes, self.selected_node, zoom=self.zoom,
                 **self._node_visual_kwargs(),
             )
+
+    # --- Renaming an item after it was created ---
+
+    def rename_context_node(self):
+        self.rename_item(self.context_node)
+
+    def rename_selected_node(self):
+        self.rename_item(self.selected_node)
+
+    def rename_item(self, node):
+        """Rename an item in place: the node plus every path reference
+        (inputs/outputs, arrowhead pair keys, chance keys), then redraw + save."""
+        if node is None:
+            return
+        old_name = node["name"]
+        new_name = simpledialog.askstring(
+            "Rename item",
+            f'New name for "{old_name}":',
+            initialvalue=old_name,
+            parent=self.root,
+        )
+        if new_name is None:
+            return  # cancelled
+        new_name = new_name.strip()
+        if not new_name:
+            messagebox.showwarning("Invalid name", "The name cannot be empty.", parent=self.root)
+            return
+        if new_name == old_name:
+            return
+        existing = self._find_node_by_name(new_name)
+        if existing is not None and existing is not node:
+            messagebox.showwarning(
+                "Duplicate Item",
+                f'"{new_name}" already exists.',
+                parent=self.root,
+            )
+            return
+        rename_item_everywhere(self.nodes, self.paths, old_name, new_name)
+        self._save_state()
+        self._redraw_scene()
+        self.refresh_legend()
+        if self.selected_node is node:
+            self.panel_title_label.configure(text=new_name)
+            self.refresh_side_panel_paths()
+        self._refresh_routes_after_edit()
+        if self.search_dropdown.winfo_ismapped():
+            self.update_search_dropdown()
+        self.show_status(f'Renamed "{old_name}" to "{new_name}"', auto_hide_ms=4000)
 
 
 def main():
