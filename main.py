@@ -1,5 +1,6 @@
 import json
 import math
+import re
 from pathlib import Path
 import tkinter as tk
 from tkinter import colorchooser, messagebox
@@ -306,10 +307,100 @@ def parse_comma_separated(text):
     return cleaned
 
 
+# --- Per-output chances (percentages, persisted in data.json inside each path) ---
+
+OUTPUT_CHANCE_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?%?")
+
+
+def parse_output_entry(text):
+    """Parse one Outputs-box entry: 'Name' or 'Name 25%' (percent sign optional).
+
+    Returns (name, chance) where chance is a float in 0..100 or None (=> 100%).
+    Raises ValueError with a user-facing message on an invalid number.
+    """
+    part = text.strip()
+    if not part:
+        return None, None
+    tokens = part.split()
+    chance = None
+    if len(tokens) > 1 and OUTPUT_CHANCE_TOKEN_RE.fullmatch(tokens[-1]):
+        try:
+            chance = float(tokens[-1].rstrip("%"))
+        except ValueError:
+            raise ValueError(f'Invalid percentage "{tokens[-1]}" in "{part}".')
+        part = " ".join(tokens[:-1])
+    elif len(tokens) == 1 and OUTPUT_CHANCE_TOKEN_RE.fullmatch(tokens[0]):
+        raise ValueError(f'Missing item name before "{tokens[0]}".')
+    elif any("%" in t or re.search(r"\d", t) for t in tokens[1:]):
+        # trailing text that looks like a mistyped percentage
+        raise ValueError(f'Invalid percentage in "{part}". Use e.g. "Flint 25%".')
+    if not part:
+        raise ValueError("Missing item name.")
+    if chance is not None and not 0.0 <= chance <= 100.0:
+        raise ValueError(f'Percentage for "{part}" must be between 0 and 100.')
+    return part, chance
+
+
+def parse_outputs_with_chances(text):
+    """Parse the Outputs box into [(name, chance_or_None)], deduped case-insensitively."""
+    entries = []
+    seen = set()
+    for part in text.split(","):
+        name, chance = parse_output_entry(part)
+        if name is None:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append((name, chance))
+    return entries
+
+
+def normalize_chances(raw):
+    """Keep only valid {output_key: chance 0..100} entries (keys lowercased)."""
+    if not isinstance(raw, dict):
+        return {}
+    cleaned = {}
+    for k, v in raw.items():
+        key = str(k).strip().lower()
+        if not key or isinstance(v, bool) or not isinstance(v, (int, float)):
+            continue
+        v = float(v)
+        if 0.0 <= v <= 100.0:
+            cleaned[key] = v
+    return cleaned
+
+
+def output_chance(path, out_name):
+    """The chance for one output item; outputs without a saved chance are 100%."""
+    chances = path.get("chances")
+    if isinstance(chances, dict):
+        v = chances.get(str(out_name).strip().lower())
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= v <= 100.0:
+            return float(v)
+    return 100.0
+
+
+def format_chance(value):
+    return f"{float(value):g}"
+
+
+def format_output_entry(path, out_name):
+    """One output as typed in the Outputs box, e.g. 'Flint 25%' (chance shown only if set)."""
+    chances = path.get("chances")
+    key = str(out_name).strip().lower()
+    if isinstance(chances, dict) and key in chances:
+        return f"{out_name} {format_chance(chances[key])}%"
+    return str(out_name)
+
+
 def format_path(path):
     method = path["method"]
     inputs_str = ", ".join(path["inputs"])
-    outputs_str = ", ".join(path["outputs"])
+    outputs_str = ", ".join(
+        f"{name} ({format_chance(output_chance(path, name))}%)" for name in path["outputs"]
+    )
     return f"{method}: {inputs_str} \u2192 {outputs_str}"
 
 
@@ -411,6 +502,19 @@ def prune_path_arrows(path):
         path.pop("arrows", None)
 
 
+def prune_path_chances(path):
+    """Drop chances for outputs no longer in the path (node deletion / path edit)."""
+    chances = path.get("chances")
+    if not isinstance(chances, dict):
+        return
+    valid = {str(o).strip().lower() for o in path.get("outputs", [])}
+    cleaned = {k: v for k, v in chances.items() if k in valid}
+    if cleaned:
+        path["chances"] = cleaned
+    else:
+        path.pop("chances", None)
+
+
 def load_data():
     if not DATA_FILE.exists():
         return [], [], {}
@@ -483,6 +587,11 @@ def load_data():
                 arrows = normalize_arrows(entry.get("arrows", {}))
                 if arrows:
                     path_entry["arrows"] = arrows
+                # Per-output chances also live inside the path; paths saved
+                # before this feature simply have no key and read as 100%
+                chances = normalize_chances(entry.get("chances"))
+                if chances:
+                    path_entry["chances"] = chances
                 paths.append(path_entry)
 
         return nodes, paths, method_colors
@@ -508,6 +617,7 @@ def save_data(nodes, paths, method_colors):
                 "inputs": list(path["inputs"]),
                 "outputs": list(path["outputs"]),
                 **({"arrows": normalize_arrows(path["arrows"])} if path.get("arrows") else {}),
+                **({"chances": normalize_chances(path["chances"])} if path.get("chances") else {}),
             }
             for path in paths
         ],
@@ -1555,7 +1665,16 @@ class CreateItemTrackerApp:
             relief=tk.FLAT,
             font=("Segoe UI", 10),
         )
-        self.outputs_entry.pack(side=tk.TOP, fill=tk.X, ipady=4, pady=(2, 10))
+        self.outputs_entry.pack(side=tk.TOP, fill=tk.X, ipady=4, pady=(2, 2))
+        tk.Label(
+            self.form_frame,
+            text='Optional chance per output, e.g. "Gravel, Flint 25%, Clay 10%" (default 100%)',
+            bg=CARD_BG,
+            fg=MUTED_FG,
+            font=("Segoe UI", 8),
+            anchor="w",
+            justify=tk.LEFT,
+        ).pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
         self.method_entry.bind("<Return>", lambda _event: self.inputs_entry.focus_set())
         self.inputs_entry.bind("<Return>", lambda _event: self.outputs_entry.focus_set())
         self.outputs_entry.bind("<Return>", lambda _event: self.submit_add_path_form())
@@ -2457,7 +2576,9 @@ class CreateItemTrackerApp:
         self.inputs_entry.delete(0, tk.END)
         self.inputs_entry.insert(0, ", ".join(path_obj["inputs"]))
         self.outputs_entry.delete(0, tk.END)
-        self.outputs_entry.insert(0, ", ".join(path_obj["outputs"]))
+        self.outputs_entry.insert(
+            0, ", ".join(format_output_entry(path_obj, o) for o in path_obj["outputs"])
+        )
         self.method_entry.focus_set()
 
     def hide_add_path_form(self):
@@ -2469,7 +2590,12 @@ class CreateItemTrackerApp:
     def submit_add_path_form(self):
         raw_method = self.method_entry.get().strip()
         raw_inputs = parse_comma_separated(self.inputs_entry.get())
-        raw_outputs = parse_comma_separated(self.outputs_entry.get())
+        try:
+            parsed_outputs = parse_outputs_with_chances(self.outputs_entry.get())
+        except ValueError as exc:
+            messagebox.showwarning("Invalid percentage", str(exc), parent=self.root)
+            return
+        raw_outputs = [name for name, _chance in parsed_outputs]
 
         if not raw_method:
             messagebox.showwarning("Missing Method", "Please enter a method name.", parent=self.root)
@@ -2493,9 +2619,12 @@ class CreateItemTrackerApp:
 
         first_input_node = self._find_node_by_name(canonical_inputs[0]) or anchor_node
         canonical_outputs = []
-        for item_name in raw_outputs:
+        chances = {}
+        for item_name, chance in parsed_outputs:
             node = self._ensure_node(item_name, near_node=first_input_node)
             canonical_outputs.append(node["name"])
+            if chance is not None:
+                chances[node["name"].strip().lower()] = float(chance)
 
         editing = self.editing_path
         is_editing = editing is not None and any(p is editing for p in self.paths)
@@ -2504,16 +2633,23 @@ class CreateItemTrackerApp:
             editing["method"] = canonical_method
             editing["inputs"] = canonical_inputs
             editing["outputs"] = canonical_outputs
-            # Arrowhead settings for input/output pairs that no longer exist are dropped
+            # Arrowhead settings are kept for input/output pairs that still exist and
+            # dropped for pairs that no longer exist
             prune_path_arrows(editing)
+            # Chances follow the outputs (each output has its own independent chance)
+            if chances:
+                editing["chances"] = chances
+            else:
+                editing.pop("chances", None)
         else:
-            self.paths.append(
-                {
-                    "method": canonical_method,
-                    "inputs": canonical_inputs,
-                    "outputs": canonical_outputs,
-                }
-            )
+            new_path = {
+                "method": canonical_method,
+                "inputs": canonical_inputs,
+                "outputs": canonical_outputs,
+            }
+            if chances:
+                new_path["chances"] = chances
+            self.paths.append(new_path)
         self.editing_path = None
 
         self._save_state()
@@ -2578,6 +2714,23 @@ class CreateItemTrackerApp:
                 highlightthickness=1,
             )
             card.pack(side=tk.TOP, fill=tk.X, pady=(0, 8))
+
+            edit_btn = tk.Button(
+                card,
+                text="Edit",
+                command=lambda p=path_obj: self.edit_path(p),
+                bg=SECONDARY_BTN_BG,
+                fg=INPUT_FG,
+                activebackground=SECONDARY_BTN_ACTIVE_BG,
+                activeforeground=BTN_FG,
+                relief=tk.FLAT,
+                bd=0,
+                padx=8,
+                pady=3,
+                font=("Segoe UI", 9, "bold"),
+                cursor="hand2",
+            )
+            edit_btn.pack(side=tk.RIGHT)
 
             del_btn = tk.Button(
                 card,
@@ -2843,6 +2996,7 @@ class CreateItemTrackerApp:
                     p["inputs"] = [n for n in p["inputs"] if n.strip().lower() != item_key]
                     p["outputs"] = [n for n in p["outputs"] if n.strip().lower() != item_key]
                     prune_path_arrows(p)
+                    prune_path_chances(p)
                     if not (p["inputs"] and p["outputs"]):
                         continue  # path would have no inputs/outputs left: delete it
                 new_paths.append(p)
