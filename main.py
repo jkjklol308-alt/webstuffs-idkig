@@ -179,21 +179,24 @@ def build_route_adjacency(paths):
 
     Each step walks one recipe (path) from one of its inputs to one of its
     outputs, in a direction the line's arrowheads allow ("walk": "fwd" =
-    input -> output, "rev" = output -> input). Outputs with a 0% chance are
-    never walked.
+    input -> output, "rev" = output -> input). A recipe that lists the same
+    output several times is still ONE step ("entries" holds every entry for
+    that output); the step is skipped only when ALL of its entries are 0%.
     """
     adj = {}
     for path in paths:
         method = path.get("method", "")
         for in_name in path.get("inputs", []):
-            for out_name in path.get("outputs", []):
-                if output_chance(path, out_name) <= 0:
-                    continue  # a 0% output can never be produced, so never walked
+            for out_name in distinct_output_names(path):
+                entries = output_entries_for(path, out_name)
+                if all(entry_chance(e) <= 0 for e in entries):
+                    continue  # only skipped when every entry for this output is 0%
                 base = {
                     "method": method,
                     "path": path,
                     "in_name": str(in_name),
                     "out_name": str(out_name),
+                    "entries": entries,
                 }
                 walk = edge_walk_directions(path, in_name, out_name)
                 if walk["fwd"]:
@@ -289,12 +292,18 @@ def step_also_inputs(step):
 
 
 def format_route_step(step, node_by_key=None):
-    """One route step, e.g. '-(Washing, 25%)-> 1 Flint', or with extra required
-    inputs: '-(Mixing, also needs 1 Flint, 50 mB Lava)-> 1 Veridium'."""
+    """One route step, e.g. '-(Washing, 25%)-> 1 Flint', with extra required
+    inputs: '-(Mixing, also needs 1 Flint, 50 mB Lava)-> 1 Veridium', or with
+    duplicate outputs: '-(Heated Fermenting)-> 1 Magma Cream (100%) + 1 Magma Cream (25%)'."""
     path = step["path"]
     bits = [str(step["method"])]
-    chance = output_chance(path, step["out_name"])
-    if chance != 100.0:
+    entries = step.get("entries")
+    if entries is None:
+        entries = output_entries_for(path, step["out_name"])
+    chance = entry_chance(entries[0]) if entries else 100.0
+    # The method-level chance is only shown for a single output entry; with
+    # duplicate outputs each entry shows its own chance after the arrow
+    if len(entries) <= 1 and chance != 100.0:
         bits.append(f"{format_chance(chance)}%")
     also = step_also_inputs(step)
     if also:
@@ -306,9 +315,17 @@ def format_route_step(step, node_by_key=None):
         )
     if step.get("walk") == "rev":
         # Walking output -> input: the destination is the recipe's input
-        dst_amount = input_amount(path, step["in_name"])
-    else:
-        dst_amount = output_amount(path, step["out_name"])
+        dst_str = format_amount(input_amount(path, step["in_name"]), step["dst"], node_by_key)
+        return f"-({', '.join(bits)})-> {dst_str}"
+    if len(entries) > 1:
+        # One step, every entry of this output shown with its amount + chance
+        entries_str = " + ".join(
+            f"{format_amount(entry_amount(e), e['name'], node_by_key)} "
+            f"({format_chance(entry_chance(e))}%)"
+            for e in entries
+        )
+        return f"-({', '.join(bits)})-> {entries_str}"
+    dst_amount = entry_amount(entries[0]) if entries else 1
     return f"-({', '.join(bits)})-> {format_amount(dst_amount, step['dst'], node_by_key)}"
 
 
@@ -335,6 +352,58 @@ def _parse_item_list(raw_items):
             seen.add(key)
             cleaned.append(text)
     return cleaned
+
+
+def _parse_output_entries(raw_outputs, raw_chances=None, raw_amounts=None):
+    """Parse saved outputs into entry dicts, in order, duplicates preserved.
+
+    Each entry is {"name": str, "amount": int, "chance": float|None}. Legacy
+    plain-string entries take their amount/chance from the path's chances and
+    amounts dicts; entry objects ({"name", "amount", "chance"}) carry their
+    own values, so the same item can appear several times with its own amount
+    and chance per entry.
+    """
+    if not isinstance(raw_outputs, list):
+        return []
+    chances = normalize_chances(raw_chances)
+    out_amounts = normalize_amounts(raw_amounts).get("outputs", {})
+    entries = []
+    for item in raw_outputs:
+        if isinstance(item, dict):
+            name = str(item.get("name", "")).strip()
+            if not name:
+                continue
+            amount = item.get("amount", 1)
+            if (
+                isinstance(amount, bool)
+                or not isinstance(amount, (int, float))
+                or (isinstance(amount, float) and not amount.is_integer())
+                or not 1 <= int(amount) <= AMOUNT_MAX
+            ):
+                amount = 1
+            chance = item.get("chance")
+            if (
+                isinstance(chance, bool)
+                or not isinstance(chance, (int, float))
+                or not 0.0 <= float(chance) <= 100.0
+            ):
+                chance = None
+            entries.append({
+                "name": name,
+                "amount": int(amount),
+                "chance": (None if chance is None else float(chance)),
+            })
+        else:
+            name = str(item).strip()
+            if not name:
+                continue
+            key = name.lower()
+            entries.append({
+                "name": name,
+                "amount": out_amounts.get(key, 1),
+                "chance": chances.get(key),
+            })
+    return entries
 
 
 def parse_comma_separated(text):
@@ -478,19 +547,18 @@ def parse_inputs_with_amounts(text):
 
 
 def parse_outputs_with_amounts_chances(text):
-    """Parse the Outputs box into [(name, amount, chance_or_None)], deduped."""
+    """Parse the Outputs box into [(name, amount, chance_or_None)], in order.
+
+    The same item may appear several times: entries are never merged or
+    rejected, each keeps its own amount and chance, e.g.
+    "1 Magma Cream 100%, 1 Magma Cream 25%".
+    """
     entries = []
-    seen = set()
     for part in text.split(","):
         parsed = parse_path_item(part, allow_chance=True)
         if parsed is None:
             continue
-        name, amount, chance = parsed
-        key = name.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        entries.append((name, amount, chance))
+        entries.append(parsed)
     return entries
 
 
@@ -509,14 +577,93 @@ def normalize_chances(raw):
     return cleaned
 
 
-def output_chance(path, out_name):
-    """The chance for one output item; outputs without a saved chance are 100%."""
-    chances = path.get("chances")
-    if isinstance(chances, dict):
-        v = chances.get(str(out_name).strip().lower())
-        if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= v <= 100.0:
-            return float(v)
+# --- Output entries: a path's outputs are ordered entries, duplicates allowed ---
+# Each entry is {"name": str, "amount": int, "chance": float|None}; the same
+# item may appear several times, each entry with its own amount and chance.
+
+
+def entry_chance(entry):
+    """An output entry's chance; entries without a saved chance are 100%."""
+    c = entry.get("chance")
+    if isinstance(c, (int, float)) and not isinstance(c, bool) and 0.0 <= float(c) <= 100.0:
+        return float(c)
     return 100.0
+
+
+def entry_amount(entry):
+    """An output entry's amount; invalid or missing amounts read as 1."""
+    a = entry.get("amount")
+    if isinstance(a, bool) or not isinstance(a, (int, float)):
+        return 1
+    if isinstance(a, float) and not a.is_integer():
+        return 1
+    iv = int(a)
+    return iv if 1 <= iv <= AMOUNT_MAX else 1
+
+
+def output_entries(path):
+    """The path's output entries in order: [{"name", "amount", "chance"}, ...].
+
+    Duplicate item names are preserved. Plain-string entries (legacy in-memory
+    paths) fall back to the path's chances/amounts dicts.
+    """
+    outs = path.get("outputs", [])
+    if not isinstance(outs, list):
+        return []
+    chances = path.get("chances") if isinstance(path.get("chances"), dict) else {}
+    amounts = path.get("amounts") if isinstance(path.get("amounts"), dict) else {}
+    out_amounts = amounts.get("outputs") if isinstance(amounts.get("outputs"), dict) else {}
+    entries = []
+    for e in outs:
+        if isinstance(e, dict):
+            name = str(e.get("name", ""))
+            if not name.strip():
+                continue
+            entries.append({
+                "name": name,
+                "amount": e.get("amount", 1),
+                "chance": e.get("chance"),
+            })
+        else:
+            name = str(e)
+            if not name.strip():
+                continue
+            key = name.strip().lower()
+            entries.append({
+                "name": name,
+                "amount": out_amounts.get(key, 1),
+                "chance": chances.get(key),
+            })
+    return entries
+
+
+def output_entries_for(path, out_name):
+    """All output entries of one item (several when it is listed repeatedly)."""
+    key = _name_key(out_name)
+    return [e for e in output_entries(path) if _name_key(e["name"]) == key]
+
+
+def output_names(path):
+    """Output item names in entry order (duplicates preserved)."""
+    return [e["name"] for e in output_entries(path)]
+
+
+def distinct_output_names(path):
+    """Output item names without duplicates, in first-seen order."""
+    seen = set()
+    names = []
+    for n in output_names(path):
+        k = _name_key(n)
+        if k not in seen:
+            seen.add(k)
+            names.append(n)
+    return names
+
+
+def output_chance(path, out_name):
+    """The chance of one output item (its first entry); default 100%."""
+    entries = output_entries_for(path, out_name)
+    return entry_chance(entries[0]) if entries else 100.0
 
 
 def format_chance(value):
@@ -528,14 +675,21 @@ def format_input_entry(path, in_name):
     return f"{input_amount(path, in_name)} {in_name}"
 
 
-def format_output_entry(path, out_name):
-    """One output as typed in the Outputs box, e.g. '1 Flint 25%' (chance shown only if set)."""
-    base = f"{output_amount(path, out_name)} {out_name}"
-    chances = path.get("chances")
-    key = str(out_name).strip().lower()
-    if isinstance(chances, dict) and key in chances:
-        base += f" {format_chance(chances[key])}%"
+def format_output_entry_data(entry):
+    """One output entry as typed in the Outputs box, e.g. '1 Flint 25%'
+    (chance shown only when set)."""
+    base = f"{entry_amount(entry)} {entry['name']}"
+    if entry.get("chance") is not None:
+        base += f" {format_chance(entry_chance(entry))}%"
     return base
+
+
+def format_output_entry(path, out_name):
+    """One output as typed in the Outputs box (the item's first entry)."""
+    entries = output_entries_for(path, out_name)
+    if not entries:
+        return f"1 {out_name}"
+    return format_output_entry_data(entries[0])
 
 
 # --- Amount accessors (stored per path as {"inputs": {key: n}, "outputs": {key: n}}) ---
@@ -584,8 +738,9 @@ def input_amount(path, in_name):
 
 
 def output_amount(path, out_name):
-    """Amount of one output item in a path; defaults to 1."""
-    return _amount_lookup(path, "outputs", out_name)
+    """Amount of one output item (its first entry); defaults to 1."""
+    entries = output_entries_for(path, out_name)
+    return entry_amount(entries[0]) if entries else 1
 
 
 def prune_path_amounts(path):
@@ -595,7 +750,7 @@ def prune_path_amounts(path):
         return
     valid = {
         "inputs": {str(i).strip().lower() for i in path.get("inputs", [])},
-        "outputs": {str(o).strip().lower() for o in path.get("outputs", [])},
+        "outputs": {_name_key(o) for o in distinct_output_names(path)},
     }
     cleaned = {}
     for side, keys in valid.items():
@@ -642,10 +797,12 @@ def format_path(path, node_by_key=None):
     inputs_str = " + ".join(
         format_amount(input_amount(path, n), n, node_by_key) for n in path["inputs"]
     )
+    # Every output entry is shown separately, in order (duplicates included),
+    # e.g. '1 Magma Cream (100%), 1 Magma Cream (25%)'
     outputs_str = ", ".join(
-        f"{format_amount(output_amount(path, n), n, node_by_key)} "
-        f"({format_chance(output_chance(path, n))}%)"
-        for n in path["outputs"]
+        f"{format_amount(entry_amount(e), e['name'], node_by_key)} "
+        f"({format_chance(entry_chance(e))}%)"
+        for e in output_entries(path)
     )
     return f"{method}: {inputs_str} \u2192 {outputs_str}"
 
@@ -657,7 +814,7 @@ def path_involves_item(path, item_name):
     for name in path.get("inputs", []):
         if name.strip().lower() == target:
             return True
-    for name in path.get("outputs", []):
+    for name in output_names(path):
         if name.strip().lower() == target:
             return True
     return False
@@ -739,7 +896,7 @@ def prune_path_arrows(path):
     valid = {
         arrow_pair_key(i, o)
         for i in path.get("inputs", [])
-        for o in path.get("outputs", [])
+        for o in distinct_output_names(path)
     }
     cleaned = {k: v for k, v in arrows.items() if k in valid}
     if cleaned:
@@ -753,7 +910,7 @@ def prune_path_chances(path):
     chances = path.get("chances")
     if not isinstance(chances, dict):
         return
-    valid = {str(o).strip().lower() for o in path.get("outputs", [])}
+    valid = {_name_key(o) for o in distinct_output_names(path)}
     cleaned = {k: v for k, v in chances.items() if k in valid}
     if cleaned:
         path["chances"] = cleaned
@@ -774,8 +931,11 @@ def rename_item_everywhere(nodes, paths, old_name, new_name):
         path["inputs"] = [
             new_name if _name_key(n) == old_key else n for n in path.get("inputs", [])
         ]
+        # Output entries (duplicates included) follow the new name; each entry
+        # keeps its own amount and chance
         path["outputs"] = [
-            new_name if _name_key(n) == old_key else n for n in path.get("outputs", [])
+            {**e, "name": new_name} if _name_key(e.get("name", "")) == old_key else e
+            for e in output_entries(path)
         ]
         arrows = path.get("arrows")
         if isinstance(arrows, dict) and arrows:
@@ -871,7 +1031,12 @@ def load_data():
                     continue
                 method = str(entry.get("method", "")).strip()
                 inputs = _parse_item_list(entry.get("inputs", []))
-                outputs = _parse_item_list(entry.get("outputs", []))
+                # Outputs keep their order; the same item may appear several
+                # times. Legacy string entries take amount/chance from the
+                # path's chances/amounts dicts, entry objects carry their own.
+                outputs = _parse_output_entries(
+                    entry.get("outputs", []), entry.get("chances"), entry.get("amounts")
+                )
                 if not method or not inputs or not outputs:
                     continue
                 mkey = method.lower()
@@ -887,16 +1052,12 @@ def load_data():
                 arrows = normalize_arrows(entry.get("arrows", {}))
                 if arrows:
                     path_entry["arrows"] = arrows
-                # Per-output chances also live inside the path; paths saved
-                # before this feature simply have no key and read as 100%
-                chances = normalize_chances(entry.get("chances"))
-                if chances:
-                    path_entry["chances"] = chances
-                # Per-item amounts; paths saved before this feature have no key
-                # and read as amount 1 for every input and output
-                amounts = normalize_amounts(entry.get("amounts"))
-                if amounts:
-                    path_entry["amounts"] = amounts
+                # Input amounts stay in the amounts dict; each output entry
+                # carries its own amount and chance (folded in above), and
+                # paths saved before that feature simply read as 1 / 100%
+                input_amounts = normalize_amounts(entry.get("amounts")).get("inputs")
+                if input_amounts:
+                    path_entry["amounts"] = {"inputs": input_amounts}
                 paths.append(path_entry)
 
         return nodes, paths, method_colors
@@ -916,20 +1077,60 @@ def _node_save_entry(node):
     return entry
 
 
+def _path_save_entry(path):
+    """One path as stored in data.json.
+
+    Without duplicate output names the legacy shape is kept (outputs as plain
+    names plus chances/amounts dicts, so existing saved paths are unaffected).
+    When the same output item appears several times, outputs are saved as one
+    object per entry, in order, each with its own amount and chance.
+    """
+    entries = output_entries(path)
+    names = [e["name"] for e in entries]
+    has_duplicate_outputs = len({_name_key(n) for n in names}) != len(names)
+    entry = {
+        "method": path["method"],
+        "inputs": list(path.get("inputs", [])),
+    }
+    if has_duplicate_outputs:
+        entry["outputs"] = [
+            {
+                "name": e["name"],
+                "amount": entry_amount(e),
+                **({"chance": entry_chance(e)} if e.get("chance") is not None else {}),
+            }
+            for e in entries
+        ]
+    else:
+        entry["outputs"] = names
+    # Per-line arrowhead settings live inside the path, so deleting
+    # the path deletes them too
+    arrows = normalize_arrows(path.get("arrows"))
+    if arrows:
+        entry["arrows"] = arrows
+    if not has_duplicate_outputs:
+        # Legacy dict form for output chances (only entries with a set chance)
+        chances = {
+            _name_key(e["name"]): entry_chance(e)
+            for e in entries
+            if e.get("chance") is not None
+        }
+        if chances:
+            entry["chances"] = chances
+    amounts = normalize_amounts(path.get("amounts"))
+    if not has_duplicate_outputs:
+        out_amounts = {_name_key(e["name"]): entry_amount(e) for e in entries}
+        if out_amounts:
+            amounts = {**amounts, "outputs": out_amounts}
+    if amounts:
+        entry["amounts"] = amounts
+    return entry
+
+
 def save_data(nodes, paths, method_colors):
     payload = {
         "nodes": [_node_save_entry(node) for node in nodes],
-        "paths": [
-            {
-                "method": path["method"],
-                "inputs": list(path["inputs"]),
-                "outputs": list(path["outputs"]),
-                **({"arrows": normalize_arrows(path["arrows"])} if path.get("arrows") else {}),
-                **({"chances": normalize_chances(path["chances"])} if path.get("chances") else {}),
-                **({"amounts": normalize_amounts(path["amounts"])} if path.get("amounts") else {}),
-            }
-            for path in paths
-        ],
+        "paths": [_path_save_entry(path) for path in paths],
         "method_colors": dict(method_colors),
     }
     with DATA_FILE.open("w", encoding="utf-8") as f:
@@ -985,7 +1186,9 @@ def connection_degree_counts(paths):
     counts = {}
     for path in paths:
         inputs = path.get("inputs", [])
-        outputs = path.get("outputs", [])
+        # One drawn line per (input, output) pair, so duplicate output entries
+        # of the same item count once
+        outputs = distinct_output_names(path)
         for name in inputs:
             key = str(name).strip().lower()
             if key:
@@ -1233,8 +1436,15 @@ def draw_connections(
             src = node_by_key.get(in_name.strip().lower())
             if src is None:
                 continue
-            for out_name in path["outputs"]:
-                dst = node_by_key.get(out_name.strip().lower())
+            # One line per input/output pair even when an output item is listed
+            # several times: duplicate entries share the pair (and its arrowheads)
+            seen_out_keys = set()
+            for out_name in output_names(path):
+                out_key = out_name.strip().lower()
+                if out_key in seen_out_keys:
+                    continue
+                seen_out_keys.add(out_key)
+                dst = node_by_key.get(out_key)
                 if dst is None:
                     continue
 
@@ -2085,7 +2295,9 @@ class CreateItemTrackerApp:
         self.outputs_entry.pack(side=tk.TOP, fill=tk.X, ipady=4, pady=(2, 2))
         self.outputs_hint_text = (
             'Amount before the name, chance after it, e.g. "1 Veridium, 2 Gravel, 1 Flint 25%" '
-            "(amount default 1, chance default 100%)"
+            "(amount default 1, chance default 100%). "
+            "The same item may be listed more than once, each entry with its own amount "
+            'and chance, e.g. "1 Magma Cream 100%, 1 Magma Cream 25%"'
         )
         self.outputs_hint = tk.Label(
             self.form_frame,
@@ -2227,14 +2439,15 @@ class CreateItemTrackerApp:
         used_in = []
         for p in self.paths:
             inputs = p.get("inputs", [])
-            outputs = p.get("outputs", [])
+            outputs = output_entries(p)
             in_inputs = any(str(n).strip().lower() == target for n in inputs)
-            in_outputs = any(str(n).strip().lower() == target for n in outputs)
+            in_outputs = any(_name_key(e["name"]) == target for e in outputs)
             inputs_str = ", ".join(
                 format_amount(input_amount(p, n), n, node_by_key) for n in inputs
             )
+            # Every output entry is listed separately, in order
             outputs_str = ", ".join(
-                format_amount(output_amount(p, n), n, node_by_key) for n in outputs
+                format_amount(entry_amount(e), e["name"], node_by_key) for e in outputs
             )
             if in_outputs:
                 made_from.append(f"{p['method']}: needs {inputs_str}")
@@ -2846,7 +3059,7 @@ class CreateItemTrackerApp:
             mkey = path["method"].strip().lower()
             if mkey not in self.method_colors:
                 self.method_colors[mkey] = pick_next_palette_color(self.method_colors)
-            for name in path["inputs"] + path["outputs"]:
+            for name in list(path["inputs"]) + output_names(path):
                 if self._find_node_by_name(name) is None:
                     self._create_node(name)
                     created_missing = True
@@ -3169,8 +3382,10 @@ class CreateItemTrackerApp:
             0, ", ".join(format_input_entry(path_obj, i) for i in path_obj["inputs"])
         )
         self.outputs_entry.delete(0, tk.END)
+        # Every output entry is re-shown as typed, in the same order
+        # (duplicate items included, each with its own amount and chance)
         self.outputs_entry.insert(
-            0, ", ".join(format_output_entry(path_obj, o) for o in path_obj["outputs"])
+            0, ", ".join(format_output_entry_data(e) for e in output_entries(path_obj))
         )
         self._reset_form_hints()
         self.method_entry.focus_set()
@@ -3235,18 +3450,20 @@ class CreateItemTrackerApp:
             input_amounts[node["name"].strip().lower()] = int(amount)
 
         first_input_node = self._find_node_by_name(canonical_inputs[0]) or anchor_node
+        # Output entries keep their order; the same item may appear several
+        # times, each entry with its own amount and chance (never merged)
         canonical_outputs = []
-        chances = {}
-        output_amounts = {}
         for item_name, amount, chance in parsed_outputs:
             node = self._ensure_node(item_name, near_node=first_input_node)
-            canonical_outputs.append(node["name"])
-            output_amounts[node["name"].strip().lower()] = int(amount)
-            if chance is not None:
-                chances[node["name"].strip().lower()] = float(chance)
+            canonical_outputs.append({
+                "name": node["name"],
+                "amount": int(amount),
+                "chance": (float(chance) if chance is not None else None),
+            })
 
-        amounts = {"inputs": input_amounts, "outputs": output_amounts}
-        amounts = normalize_amounts(amounts)
+        # Input amounts stay in the amounts dict; each output entry carries
+        # its own amount and chance
+        amounts = normalize_amounts({"inputs": input_amounts})
 
         editing = self.editing_path
         is_editing = editing is not None and any(p is editing for p in self.paths)
@@ -3258,11 +3475,8 @@ class CreateItemTrackerApp:
             # Arrowhead settings are kept for input/output pairs that still exist and
             # dropped for pairs that no longer exist
             prune_path_arrows(editing)
-            # Chances follow the outputs (each output has its own independent chance)
-            if chances:
-                editing["chances"] = chances
-            else:
-                editing.pop("chances", None)
+            # Output chances live on the output entries now
+            editing.pop("chances", None)
             # Amounts follow the items (kept for items still in the path)
             if amounts:
                 editing["amounts"] = amounts
@@ -3274,8 +3488,6 @@ class CreateItemTrackerApp:
                 "inputs": canonical_inputs,
                 "outputs": canonical_outputs,
             }
-            if chances:
-                new_path["chances"] = chances
             if amounts:
                 new_path["amounts"] = amounts
             self.paths.append(new_path)
@@ -3591,7 +3803,7 @@ class CreateItemTrackerApp:
             # deleted only when no inputs or no outputs would remain
             def would_be_empty(p):
                 ins = [n for n in p["inputs"] if n.strip().lower() != item_key]
-                outs = [n for n in p["outputs"] if n.strip().lower() != item_key]
+                outs = [e for e in output_entries(p) if _name_key(e["name"]) != item_key]
                 return not ins or not outs
 
             dying = sum(1 for p in related_paths if would_be_empty(p))
@@ -3626,7 +3838,9 @@ class CreateItemTrackerApp:
             for p in self.paths:
                 if id(p) in related_ids:
                     p["inputs"] = [n for n in p["inputs"] if n.strip().lower() != item_key]
-                    p["outputs"] = [n for n in p["outputs"] if n.strip().lower() != item_key]
+                    p["outputs"] = [
+                        e for e in output_entries(p) if _name_key(e["name"]) != item_key
+                    ]
                     prune_path_arrows(p)
                     prune_path_chances(p)
                     prune_path_amounts(p)
