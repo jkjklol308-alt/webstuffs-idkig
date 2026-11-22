@@ -61,8 +61,8 @@ DIM_BLEND_FACTOR = 0.25  # 25% method colour + 75% canvas background
 
 # Route finding (Shift+click two nodes, highlight every route between them).
 # Routes are capped so huge webs cannot freeze the app.
-ROUTE_MAX_STEPS = 15  # a route may use at most this many lines
-ROUTE_MAX_ROUTES = 100  # at most this many routes are collected
+ROUTE_MAX_STEPS = 15  # a route may use at most this many recipes (steps)
+ROUTE_MAX_ROUTES = 100  # at most this many routes are collected per direction
 ROUTE_HIGHLIGHT_COLOR = "#ffd166"  # bright ring/outline for endpoints and route items
 ROUTE_RING_PAD_PX = 6  # ring padding around endpoint nodes, in screen pixels
 ROUTE_RING_WIDTH_PX = 3
